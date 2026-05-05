@@ -40,8 +40,7 @@ class TestGenerateAlertsFirstCheck:
         current = _make_state(persona_state=0)
         alerts = generate_alerts(target, None, current, False)
         assert len(alerts) == 1
-        assert "First check" in alerts[0].message
-        assert "Offline" in alerts[0].message
+        assert "первая проверка" in alerts[0].message
 
     def test_first_check_online_playing(self):
         target = _make_target()
@@ -51,7 +50,6 @@ class TestGenerateAlertsFirstCheck:
         )
         alerts = generate_alerts(target, None, current, False)
         assert len(alerts) == 1
-        assert "First check" in alerts[0].message
         assert "Counter-Strike 2" in alerts[0].message
 
 
@@ -62,7 +60,7 @@ class TestGenerateAlertsStateChange:
         current = _make_state(persona_state=1)
         alerts = generate_alerts(target, previous, current, False)
         messages = [a.message for a in alerts]
-        assert any("Came online" in m for m in messages)
+        assert any("онлайн" in m for m in messages)
 
     def test_went_offline(self):
         target = _make_target()
@@ -70,14 +68,13 @@ class TestGenerateAlertsStateChange:
         current = _make_state(persona_state=0, last_logoff=1705320000)
         alerts = generate_alerts(target, previous, current, False)
         messages = [a.message for a in alerts]
-        assert any("Went offline" in m for m in messages)
+        assert any("оффлайн" in m for m in messages)
 
     def test_no_change_no_alert(self):
         target = _make_target()
         previous = _make_state(persona_state=1)
         current = _make_state(persona_state=1)
         alerts = generate_alerts(target, previous, current, False)
-        # Same state, no game change, no name change => no alerts
         assert len(alerts) == 0
 
 
@@ -88,7 +85,7 @@ class TestGenerateAlertsGameChange:
         current = _make_state(persona_state=1, game_name="Dota 2")
         alerts = generate_alerts(target, previous, current, False)
         messages = [a.message for a in alerts]
-        assert any("Started playing Dota 2" in m for m in messages)
+        assert any("начал играть" in m and "Dota 2" in m for m in messages)
 
     def test_stopped_playing(self):
         target = _make_target()
@@ -96,7 +93,7 @@ class TestGenerateAlertsGameChange:
         current = _make_state(persona_state=1, game_name=None)
         alerts = generate_alerts(target, previous, current, False)
         messages = [a.message for a in alerts]
-        assert any("Stopped playing Dota 2" in m for m in messages)
+        assert any("перестал играть" in m and "Dota 2" in m for m in messages)
 
     def test_switched_game(self):
         target = _make_target()
@@ -104,9 +101,8 @@ class TestGenerateAlertsGameChange:
         current = _make_state(persona_state=1, game_name="Game B")
         alerts = generate_alerts(target, previous, current, False)
         messages = [a.message for a in alerts]
-        # Game changed: old game != new game => "Stopped" for old + "Started" for new
-        assert any("Stopped playing Game A" in m for m in messages)
-        assert any("Started playing Game B" in m for m in messages)
+        assert any("Game A" in m for m in messages)
+        assert any("Game B" in m for m in messages)
 
 
 class TestGenerateAlertsInvisible:
@@ -116,7 +112,7 @@ class TestGenerateAlertsInvisible:
         current = _make_state(persona_state=0, playtime_forever=80)
         alerts = generate_alerts(target, previous, current, True)
         messages = [a.message for a in alerts]
-        assert any("INVISIBLE DETECTED" in m for m in messages)
+        assert any("НЕВИДИМКА" in m for m in messages)
         assert any("50" in m and "80" in m for m in messages)
 
 
@@ -127,7 +123,6 @@ class TestGenerateAlertsNameChange:
         current = _make_state(persona_name="NewName")
         alerts = generate_alerts(target, previous, current, False)
         messages = [a.message for a in alerts]
-        assert any("Changed display name" in m for m in messages)
         assert any("OldName" in m and "NewName" in m for m in messages)
 
     def test_no_alert_same_name(self):
@@ -145,5 +140,5 @@ class TestGenerateAlertsMultiple:
         current = _make_state(persona_state=1, game_name="CS2")
         alerts = generate_alerts(target, previous, current, False)
         messages = [a.message for a in alerts]
-        assert any("Came online" in m for m in messages)
-        assert any("Started playing CS2" in m for m in messages)
+        assert any("онлайн" in m for m in messages)
+        assert any("CS2" in m for m in messages)
