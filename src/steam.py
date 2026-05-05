@@ -1,0 +1,133 @@
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+
+import aiohttp
+
+from .config import STEAM_API_BASE, PERSONA_STATES
+from .models import SteamProfile, RecentGames
+
+logger = logging.getLogger(__name__)
+
+
+def state_name(persona_state: int) -> str:
+    """Convert persona_state integer to human-readable name."""
+    return PERSONA_STATES.get(persona_state, f"Unknown ({persona_state})")
+
+
+def format_last_seen(last_logoff: Optional[int]) -> str:
+    """Format a Unix timestamp into a human-readable last-seen string."""
+    if last_logoff is None:
+        return "never"
+    dt = datetime.fromtimestamp(last_logoff, tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def detect_invisible(
+    persona_state: int,
+    current_playtime: int,
+    previous_playtime: Optional[int],
+) -> bool:
+    """
+    Detect if a user is likely invisible/offline but actually playing.
+
+    A user is 'invisible' if their persona_state is 0 (offline) but
+    their total playtime has increased since the last check.
+    """
+    if persona_state != 0:
+        return False
+    if previous_playtime is None:
+        return False
+    return current_playtime > previous_playtime
+
+
+class SteamClient:
+    """Steam API client with session reuse and rate limiting."""
+
+    def __init__(self, session: aiohttp.ClientSession):
+        self._session = session
+        self._last_request_time: float = 0.0
+        self._min_interval: float = 1.0  # 1 req/sec
+
+    async def _rate_limit(self) -> None:
+        """Ensure we don't exceed 1 request per second."""
+        now = asyncio.get_event_loop().time()
+        elapsed = now - self._last_request_time
+        if elapsed < self._min_interval:
+            await asyncio.sleep(self._min_interval - elapsed)
+        self._last_request_time = asyncio.get_event_loop().time()
+
+    async def _get(self, url: str, params: dict) -> dict:
+        """Make a rate-limited GET request to the Steam API."""
+        await self._rate_limit()
+        async with self._session.get(url, params=params) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+    async def get_player_summaries(
+        self, api_key: str, steam_id: str
+    ) -> Optional[SteamProfile]:
+        """Fetch player summary for a single Steam ID."""
+        url = f"{STEAM_API_BASE}/ISteamUser/GetPlayerSummaries/v0002/"
+        params = {
+            "key": api_key,
+            "steamids": steam_id,
+        }
+        try:
+            data = await self._get(url, params)
+            players = data.get("response", {}).get("players", [])
+            if not players:
+                return None
+            p = players[0]
+            return SteamProfile(
+                steam_id=str(p["steamid"]),
+                persona_name=p.get("personaname", "Unknown"),
+                persona_state=p.get("personastate", 0),
+                game_id=str(p["gameid"]) if p.get("gameid") else None,
+                game_name=p.get("gameextrainfo"),
+                last_logoff=p.get("lastlogoff"),
+            )
+        except Exception as e:
+            logger.error("Failed to get player summary for %s: %s", steam_id, e)
+            return None
+
+    async def get_recently_played(
+        self, api_key: str, steam_id: str
+    ) -> RecentGames:
+        """Fetch recently played games for a Steam ID."""
+        url = f"{STEAM_API_BASE}/IPlayerService/GetRecentlyPlayedGames/v0001/"
+        params = {
+            "key": api_key,
+            "steamid": steam_id,
+        }
+        try:
+            data = await self._get(url, params)
+            games_data = data.get("response", {}).get("games", [])
+            games = [
+                {
+                    "appid": g["appid"],
+                    "name": g.get("name", "Unknown"),
+                    "playtime_forever": g.get("playtime_forever", 0),
+                }
+                for g in games_data
+            ]
+            total = data.get("response", {}).get("total_count", len(games))
+            return RecentGames(steam_id=steam_id, games=games)
+        except Exception as e:
+            logger.error("Failed to get recently played for %s: %s", steam_id, e)
+            return RecentGames(steam_id=steam_id, games=[])
+
+    async def validate_key(self, api_key: str) -> bool:
+        """Validate an API key by making a lightweight request."""
+        url = f"{STEAM_API_BASE}/ISteamUser/GetPlayerSummaries/v0002/"
+        params = {
+            "key": api_key,
+            "steamids": "76561197960287930",  # Gabe's well-known ID
+        }
+        try:
+            data = await self._get(url, params)
+            # If we get a response without error, the key is valid
+            return "response" in data
+        except Exception:
+            return False

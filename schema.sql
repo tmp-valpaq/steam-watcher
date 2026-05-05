@@ -1,28 +1,27 @@
--- Users and their Steam API keys
 CREATE TABLE IF NOT EXISTS users (
-    tg_id INTEGER PRIMARY KEY,
-    steam_api_key TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    telegram_id INTEGER PRIMARY KEY,
+    steam_api_key TEXT NOT NULL
 );
 
--- Monitoring targets
 CREATE TABLE IF NOT EXISTS targets (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    tg_id INTEGER NOT NULL,
+    telegram_id INTEGER NOT NULL,
     steam_id TEXT NOT NULL,
     name TEXT NOT NULL,
-    watch_interval INTEGER DEFAULT 30,
-    is_active INTEGER DEFAULT 1,
-    FOREIGN KEY (tg_id) REFERENCES users(tg_id),
-    UNIQUE(tg_id, steam_id)
+    interval_seconds INTEGER NOT NULL DEFAULT 300,
+    active INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY (telegram_id) REFERENCES users(telegram_id),
+    UNIQUE(telegram_id, steam_id)
 );
 
--- State tracking (last known playtime, status)
-CREATE TABLE IF NOT EXISTS target_state (
+CREATE TABLE IF NOT EXISTS target_states (
     target_id INTEGER PRIMARY KEY,
-    persona_state INTEGER DEFAULT 0,
-    current_game TEXT,
-    playtime_map TEXT DEFAULT '{}',
-    last_alert TEXT,
-    FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE CASCADE
+    persona_state INTEGER,
+    persona_name TEXT,
+    game_id TEXT,
+    game_name TEXT,
+    playtime_forever INTEGER,
+    last_logoff INTEGER,
+    last_checked INTEGER,
+    FOREIGN KEY (target_id) REFERENCES targets(id)
 );
