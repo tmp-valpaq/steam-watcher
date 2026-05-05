@@ -2,7 +2,7 @@
 
 ## Overview
 
-Steam Watcher is a Telegram bot that monitors Steam profiles and sends alerts when tracked players change status, start/stop games, or go invisible.
+Steam Watcher — single-process Telegram бот для мониторинга Steam-профилей с детектом невидимок.
 
 ## Layers
 
@@ -30,52 +30,75 @@ Steam Watcher is a Telegram bot that monitors Steam profiles and sends alerts wh
 
 ## Data Flow
 
-1. **User registers** via Telegram commands → `bot.py` validates and stores via `db.py`
-2. **Watcher polls** every 10s for targets due for a check
-3. For each due target: fetch profile (`steam.py`) → compare to previous state (`db.py`) → generate alerts (`watcher.py`)
-4. **Alerts** are sent via `bot.send_message` (plain text, no parse mode)
+1. **Регистрация** — юзер шлёт `/setkey` → bot.py валидирует ключ через Steam API → сохраняет в db.py
+2. **Добавление таргета** — `/add` → bot.py проверяет что профиль существует → сохраняет в db.py
+3. **Поллинг** — watcher.py каждые 30с забирает все активные таргеты из db.py, для каждого чекает Steam API
+4. **Алерты** — watcher.py сравнивает текущий стейт с предыдущим → генерирует алерты → шлёт через bot.send_message
+5. **Состояние** — каждый чек обновляет target_state в db.py (persona_state, current_game, playtime_map)
+
+## Invisible Detection
+
+Ключевая фича. Steam позволяет ставить "Невидимку" — статус показывает offline, но наигранные часы продолжают тикать.
+
+Алгоритм:
+1. `persona_state == 0` (offline)
+2. `playtime_forever` для какой-либо игры увеличился с прошлого чека
+3. Оба условия → пользователь играет в невидимке
+
+Ограничение: если юзер только зашёл в игру и ещё не наиграл ни минуты — не детектится. Playtime обновляется раз в ~1 минуту.
 
 ## Key Components
 
 ### config.py
-- Reads `STEAM_BOT_TOKEN` from environment
-- Defines DB path, API base URL, persona state map
+- `STEAM_BOT_TOKEN` из окружения
+- `DB_PATH` — путь к SQLite файлу
+- `PERSONA_STATES` — мапа Steam статусов
 
 ### models.py
-- Dataclasses: `User`, `Target`, `TargetState`, `Alert`, `SteamProfile`, `RecentGames`
-- Pure data, no behavior
+Dataclasses: `User`, `Target`, `TargetState`, `Alert`, `SteamProfile`, `RecentGames`. Чистые данные, без логики.
 
 ### steam.py
-- `SteamClient` wraps `aiohttp.ClientSession`
-- Rate limited to 1 req/sec
-- Methods: `get_player_summaries`, `get_recently_played`, `validate_key`
+- `SteamClient` — обёртка над `aiohttp.ClientSession`, rate limit 1 req/sec
+- Методы: `get_player_summaries`, `get_recently_played`, `validate_key`
 - Pure functions: `state_name`, `format_last_seen`, `detect_invisible`
 
 ### db.py
-- Single `aiosqlite.Connection` passed throughout
-- CRUD for users, targets, target_states
-- Schema initialized from `schema.sql`
+- Один `aiosqlite.Connection`, передаётся через DI
+- CRUD для users, targets, target_states
+- Схема из `schema.sql`
 
 ### watcher.py
-- `generate_alerts()` — pure function, no I/O, fully testable
-- `Watcher` class — async task that polls and dispatches alerts
-- Alert callback injected for testability
+- `generate_alerts()` — чистая функция, без I/O, полностью тестируемая
+- `Watcher` — async task, поллит таргеты и отправляет алерты
+- Alert callback инжектится для тестируемости
 
 ### bot.py
-- aiogram 3.x router with command handlers
-- All responses are plain text (no parse_mode)
-- Receives `db_conn` and `steam_client` via closure
+- aiogram 3.x router с хендлерами команд
+- Все ответы plain text (без parse_mode — avoids crashes)
+- Получает `db_conn` и `steam_client` через closure
 
 ### main.py
-- Creates `aiosqlite` connection and `aiohttp.ClientSession`
-- Wires up `SteamClient`, `Watcher`, `Bot`, `Dispatcher`
-- Manages lifecycle (startup/shutdown)
+- Создаёт `aiosqlite` connection и `aiohttp.ClientSession`
+- Связывает `SteamClient`, `Watcher`, `Bot`, `Dispatcher`
+- Управляет lifecycle (startup/shutdown)
 
 ## Design Decisions
 
-- **Plain text messages**: Avoids crashes from unescaped special characters in Steam names
-- **Single DB connection**: Simple, no connection pool complexity
-- **Single HTTP session**: Shared across all API calls
-- **Rate limiting**: 1 req/sec per API key, enforced in SteamClient
-- **Testability**: Alert logic is a pure function separated from I/O
-- **Invisible detection**: `persona_state == 0` but `playtime_forever` increasing
+| Решение | Почему |
+|---------|--------|
+| Plain text сообщения | Спецсимволы в Steam-никах крашат Telegram API с Markdown/HTML |
+| Один DB connection | Single-process, нет смысла в пуле |
+| Один HTTP session | aiohttp сессия переиспользуется, нет накладных расходов |
+| Rate limit 1 req/s per key | Steam не документирует лимиты, перестраховка |
+| generate_alerts() — pure | Легко тестировать без моков I/O |
+| DB path в корне проекта | Просто и предсказуемо для single-instance |
+
+## Scalability
+
+Сейчас: single-process, SQLite. Лимит ~100-200 таргетов на инстанс.
+
+Если нужно больше:
+- SQLite → PostgreSQL
+- Добавить Redis для rate limiting
+- Watcher → отдельный worker с очередью
+- Bot → webhook вместо polling

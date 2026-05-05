@@ -1,78 +1,89 @@
 # Steam Watcher
 
-A Telegram bot that monitors Steam profiles and sends you alerts when your tracked players come online, start playing games, go offline, or try to appear invisible.
+Telegram-бот для мониторинга Steam-профилей. Присылает уведомления когда отслеживаемые игроки заходят онлайн, начинают играть, выходят или пытаются казаться невидимыми.
 
-## Features
+## Возможности
 
-- Track multiple Steam profiles
-- Real-time status change alerts
-- Invisible/offline detection (shows offline but playtime is increasing)
-- Game start/stop notifications
-- Pause/resume individual targets
-- Instant profile check command
+- Отслеживание нескольких профилей Steam
+- Уведомления об изменении статуса в реальном времени
+- Детект невидимок (статус offline, но наигранные часы растут)
+- Уведомления о начале/конце игры
+- Пауза/возобновление для каждого таргета
+- Мгновенная проверка профиля по команде
+- Каждый юзер использует свой Steam API ключ — лимиты не шарятся
 
-## Setup
-
-### Prerequisites
+## Что нужно
 
 - Python 3.11+
-- A Telegram bot token (from [@BotFather](https://t.me/BotFather))
-- A Steam Web API key (from [Steam](https://steamcommunity.com/dev/apikey))
+- Токен Telegram бота (от [@BotFather](https://t.me/BotFather))
+- Steam Web API ключ (бесплатно, от [Steam](https://steamcommunity.com/dev/apikey))
 
-### Install
+## Установка
 
 ```bash
+git clone https://github.com/tmp-valpaq/steam-watcher.git
 cd steam-watcher
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Configure
-
-Set the environment variable:
+## Запуск
 
 ```bash
-export STEAM_BOT_TOKEN="your_telegram_bot_token"
-```
-
-### Run
-
-```bash
+export STEAM_BOT_TOKEN="токен_от_botfather"
 python -m src.main
 ```
 
-## Commands
+## Как использовать
 
-| Command | Description |
-|---------|-------------|
-| `/start` | Show help text |
-| `/setkey API_KEY` | Set your Steam Web API key (validated) |
-| `/add STEAMID64 NAME` | Add a target to monitor |
-| `/remove STEAMID64` | Remove a target |
-| `/list` | Show all targets with current status |
-| `/pause STEAMID64` | Pause monitoring for a target |
-| `/resume STEAMID64` | Resume monitoring for a target |
-| `/check STEAMID64` | Instant check of a target's profile |
+### 1. Получить Steam API ключ
+Иди на https://steamcommunity.com/dev/apikey — логинься через Steam, в поле "Domain" пиши что угодно (например `localhost`). Ключ бесплатный, получают мгновенно.
 
-## Usage Flow
+### 2. Узнать SteamID64
+Иди на https://steamid.io — вставь ссылку на Steam-профиль человека, получишь 17-значный номер вида `76561198XXXXXXXXX`.
 
-1. Start a chat with your bot and send `/start`
-2. Set your Steam API key: `/setkey YOUR_KEY`
-3. Add targets: `/add 76561198000000001 MyFriend`
-4. The bot will now monitor and alert you on changes
+### 3. Настроить бота
+В Telegram:
+```
+/start                          — помощь
+/setkey XXXXXXXXXX              — добавить свой Steam API ключ
+/add 76561198XXXXXXXXX Вася     — добавить таргет для мониторинга
+```
 
-## Testing
+### 4. Пользоваться
+Бот автоматически мониторит все добавленные таргеты каждые 30 секунд и присылает уведомления.
+
+## Команды
+
+- `/start` — показать помощь
+- `/setkey API_KEY` — добавить Steam API ключ (проверяется валидность)
+- `/add STEAMID64 ИМЯ` — добавить таргет
+- `/remove STEAMID64` — удалить таргет
+- `/list` — список всех таргетов с текущим статусом
+- `/pause STEAMID64` — приостановить мониторинг таргета
+- `/resume STEAMID64` — возобновить мониторинг
+- `/check STEAMID64` — мгновенная проверка профиля
+
+## Важно
+
+- Профиль отслеживаемого игрока должен быть **публичным** (Public). Приватные профили не отдаются через API.
+- API ключ привязан к твоему аккаунту Steam. Не делись им.
+- Бот проверяет каждые 30 секунд. Невидимка детектится по росту наигранных часов — если `playtime_forever` увеличился, а статус offline, значит человек играет.
+
+## Тесты
 
 ```bash
 pytest tests/ -v
 ```
 
-## Deployment
+42 теста покрывают: Steam API логику, генерацию алертов, CRUD операции с БД.
+
+## Деплой
 
 ### Systemd
 
-Create `/etc/systemd/system/steam-watcher.service`:
+Создай `/etc/systemd/system/steam-watcher.service`:
 
 ```ini
 [Unit]
@@ -81,15 +92,19 @@ After=network.target
 
 [Service]
 Type=simple
-User=steambot
 WorkingDirectory=/opt/steam-watcher
-Environment=STEAM_BOT_TOKEN=your_token
+Environment=STEAM_BOT_TOKEN=вставь_сюда_токен_от_botfather
 ExecStart=/opt/steam-watcher/.venv/bin/python -m src.main
 Restart=always
 RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
+```
+
+```bash
+systemctl enable steam-watcher
+systemctl start steam-watcher
 ```
 
 ### Docker
@@ -106,25 +121,24 @@ CMD ["python", "-m", "src.main"]
 ```bash
 docker build -t steam-watcher .
 docker run -d --name steam-watcher \
-  -e STEAM_BOT_TOKEN=your_token \
-  -v steam-watcher-data:/app/data \
+  -e STEAM_BOT_TOKEN=вставь_сюда_токен_от_botfather \
   steam-watcher
 ```
 
-## Project Structure
+## Структура проекта
 
 ```
 steam-watcher/
 ├── src/
-│   ├── config.py      # Environment config, constants
-│   ├── models.py      # Dataclasses
-│   ├── steam.py       # Steam API client
+│   ├── config.py      # Конфигурация из env, константы
+│   ├── models.py      # Датаклассы
+│   ├── steam.py       # Клиент Steam API
 │   ├── db.py          # SQLite CRUD
-│   ├── watcher.py     # Background polling + alerts
-│   ├── bot.py         # Telegram command handlers
-│   └── main.py        # Entry point
+│   ├── watcher.py     # Фоновый поллинг + генерация алертов
+│   ├── bot.py         # Telegram обработчики команд
+│   └── main.py        # Точка входа
 ├── tests/
-│   ├── conftest.py    # Test fixtures
+│   ├── conftest.py    # Фикстуры (in-memory DB, моки)
 │   ├── test_steam.py
 │   ├── test_watcher.py
 │   └── test_db.py
