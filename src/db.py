@@ -118,6 +118,17 @@ async def set_target_active(
     return cursor.rowcount > 0
 
 
+async def rename_target(
+    db: aiosqlite.Connection, telegram_id: int, steam_id: str, new_name: str
+) -> bool:
+    cursor = await db.execute(
+        "UPDATE targets SET name = ? WHERE telegram_id = ? AND steam_id = ?",
+        (new_name, telegram_id, steam_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
 # ── TargetState CRUD ───────────────────────────────────────────────────
 
 async def get_target_state(db: aiosqlite.Connection, target_id: int) -> Optional[TargetState]:

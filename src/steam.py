@@ -118,6 +118,20 @@ class SteamClient:
             logger.error("Failed to get recently played for %s: %s", steam_id, e)
             return RecentGames(steam_id=steam_id, games=[])
 
+    async def resolve_vanity_url(self, api_key: str, vanity: str) -> Optional[str]:
+        """Resolve a vanity URL name to a SteamID64."""
+        url = f"{STEAM_API_BASE}/ISteamUser/ResolveVanityURL/v0001/"
+        params = {"key": api_key, "vanityurl": vanity}
+        try:
+            data = await self._get(url, params)
+            response = data.get("response", {})
+            if response.get("success") == 1:
+                return response.get("steamid")
+            return None
+        except Exception as e:
+            logger.error("Failed to resolve vanity URL %s: %s", vanity, e)
+            return None
+
     async def validate_key(self, api_key: str) -> bool:
         """Validate an API key by making a lightweight request."""
         url = f"{STEAM_API_BASE}/ISteamUser/GetPlayerSummaries/v0002/"

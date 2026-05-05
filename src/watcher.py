@@ -156,7 +156,16 @@ class Watcher:
         for telegram_id, user_target_list in user_targets.items():
             user = await db.get_user(self._db, telegram_id)
             if user is None:
-                continue
+                # Use default API key for users without their own
+                from .config import DEFAULT_STEAM_API_KEY
+                api_key = DEFAULT_STEAM_API_KEY
+                if not api_key:
+                    continue
+            else:
+                from .config import DEFAULT_STEAM_API_KEY
+                api_key = user.steam_api_key or DEFAULT_STEAM_API_KEY
+                if not api_key:
+                    continue
 
             for target in user_target_list:
                 state = await db.get_target_state(self._db, target.id)
@@ -164,7 +173,7 @@ class Watcher:
                 if state and (now - state.last_checked) < target.interval_seconds:
                     continue
 
-                await self._check_target(user.steam_api_key, target)
+                await self._check_target(api_key, target)
 
     async def _check_target(self, api_key: str, target: Target) -> None:
         now = int(time.time())
