@@ -6,10 +6,25 @@ from typing import List, Optional, Callable, Awaitable, Dict
 import aiosqlite
 
 from . import db
+from .match_tracker import MatchTracker
 from .models import Target, TargetState, Alert
 from .steam import SteamClient, state_name, format_last_seen, detect_invisible
 
 logger = logging.getLogger(__name__)
+
+MATCH_POLL_INTERVAL = 300
+
+
+def format_time_ago(timestamp: int) -> str:
+    """Format a unix timestamp as a human-readable Russian relative time."""
+    delta = max(0, int(time.time()) - int(timestamp))
+    if delta < 60:
+        return f"{delta} сек назад"
+    if delta < 3600:
+        return f"{delta // 60} мин назад"
+    if delta < 86400:
+        return f"{delta // 3600} ч назад"
+    return f"{delta // 86400} дн назад"
 
 
 def generate_alerts(
@@ -113,12 +128,15 @@ class Watcher:
         db_conn: aiosqlite.Connection,
         steam_client: SteamClient,
         send_alert: Callable[[int, str], Awaitable[None]],
+        match_tracker: Optional[MatchTracker] = None,
     ):
         self._db = db_conn
         self._steam = steam_client
         self._send_alert = send_alert
+        self._match_tracker = match_tracker
         self._task: Optional[asyncio.Task] = None
         self._running = False
+        self._last_match_poll: float = 0.0
 
     async def start(self) -> None:
         self._running = True
@@ -141,6 +159,16 @@ class Watcher:
                 await self._poll_all()
             except Exception as e:
                 logger.error("Error in watcher loop: %s", e)
+
+            if self._match_tracker is not None:
+                now = time.time()
+                if now - self._last_match_poll >= MATCH_POLL_INTERVAL:
+                    self._last_match_poll = now
+                    try:
+                        await self._poll_matches()
+                    except Exception as e:
+                        logger.error("Error in match poll: %s", e)
+
             await asyncio.sleep(10)
 
     async def _poll_all(self) -> None:
@@ -235,3 +263,49 @@ class Watcher:
                 logger.error("Failed to send alert: %s", e)
 
         await db.save_target_state(self._db, current_state)
+
+    async def _poll_matches(self) -> None:
+        """Best-effort poll for new Dota 2 matches on offline/invisible targets."""
+        if self._match_tracker is None:
+            return
+
+        targets = await db.get_active_targets(self._db)
+        now = int(time.time())
+
+        for target in targets:
+            state = await db.get_target_state(self._db, target.id)
+            if state is None:
+                continue
+
+            # Only poll offline/invisible targets — online players don't need this check
+            if state.persona_state != 0:
+                continue
+
+            if state.last_match_time and (now - state.last_match_time) < MATCH_POLL_INTERVAL:
+                continue
+
+            try:
+                match = await self._match_tracker.get_last_match(target.steam_id)
+            except Exception as e:
+                logger.error("Match lookup failed for %s: %s", target.name, e)
+                continue
+
+            if match is None:
+                continue
+
+            if match.match_id == state.last_match_id:
+                continue
+
+            state.last_match_id = match.match_id
+            state.last_match_time = now
+            await db.save_target_state(self._db, state)
+
+            time_ago = format_time_ago(match.start_time)
+            message = (
+                f"🕵️ {target.name}: скрытая активность! "
+                f"Катал Dota 2 {time_ago} (матч {match.match_id})"
+            )
+            try:
+                await self._send_alert(target.telegram_id, message)
+            except Exception as e:
+                logger.error("Failed to send hidden_activity alert: %s", e)

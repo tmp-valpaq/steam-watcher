@@ -134,7 +134,7 @@ async def rename_target(
 async def get_target_state(db: aiosqlite.Connection, target_id: int) -> Optional[TargetState]:
     async with db.execute(
         "SELECT target_id, persona_state, persona_name, game_id, game_name, "
-        "playtime_forever, last_logoff, last_checked "
+        "playtime_forever, last_logoff, last_checked, last_match_id, last_match_time "
         "FROM target_states WHERE target_id = ?",
         (target_id,),
     ) as cur:
@@ -150,6 +150,8 @@ async def get_target_state(db: aiosqlite.Connection, target_id: int) -> Optional
             playtime_forever=row[5],
             last_logoff=row[6],
             last_checked=row[7],
+            last_match_id=row[8],
+            last_match_time=row[9],
         )
 
 
@@ -157,8 +159,8 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
     await db.execute(
         "INSERT INTO target_states "
         "(target_id, persona_state, persona_name, game_id, game_name, "
-        "playtime_forever, last_logoff, last_checked) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "playtime_forever, last_logoff, last_checked, last_match_id, last_match_time) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(target_id) DO UPDATE SET "
         "persona_state = excluded.persona_state, "
         "persona_name = excluded.persona_name, "
@@ -166,7 +168,9 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
         "game_name = excluded.game_name, "
         "playtime_forever = excluded.playtime_forever, "
         "last_logoff = excluded.last_logoff, "
-        "last_checked = excluded.last_checked",
+        "last_checked = excluded.last_checked, "
+        "last_match_id = excluded.last_match_id, "
+        "last_match_time = excluded.last_match_time",
         (
             state.target_id,
             state.persona_state,
@@ -176,6 +180,8 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
             state.playtime_forever,
             state.last_logoff,
             state.last_checked,
+            state.last_match_id,
+            state.last_match_time,
         ),
     )
     await db.commit()

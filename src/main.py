@@ -8,6 +8,7 @@ import aiosqlite
 
 from .config import DB_PATH, STEAM_BOT_TOKEN
 from .db import init_db
+from .match_tracker import MatchTracker
 from .steam import SteamClient
 from .watcher import Watcher
 from .bot import setup_bot
@@ -36,6 +37,7 @@ async def main() -> None:
         # Single HTTP session
         async with aiohttp.ClientSession() as session:
             steam_client = SteamClient(session)
+            match_tracker = MatchTracker(session)
 
             # Create bot
             bot = Bot(token=STEAM_BOT_TOKEN)
@@ -45,7 +47,7 @@ async def main() -> None:
                 await bot.send_message(chat_id=telegram_id, text=message)
 
             # Start watcher
-            watcher = Watcher(db_conn, steam_client, send_alert)
+            watcher = Watcher(db_conn, steam_client, send_alert, match_tracker)
             await watcher.start()
 
             # Setup and start bot dispatcher

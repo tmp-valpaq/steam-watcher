@@ -28,6 +28,8 @@ class TargetState:
     playtime_forever: int = 0
     last_logoff: Optional[int] = None
     last_checked: int = 0
+    last_match_id: Optional[str] = None
+    last_match_time: Optional[int] = None
 
 
 @dataclass
@@ -44,6 +46,16 @@ class SteamProfile:
     game_id: Optional[str] = None
     game_name: Optional[str] = None
     last_logoff: Optional[int] = None
+
+
+@dataclass
+class MatchInfo:
+    match_id: str
+    steam_id: str
+    game: str  # "dota2", "cs2", etc.
+    start_time: int  # unix timestamp
+    duration: int  # seconds
+    hero_name: Optional[str] = None  # for Dota
 
 
 @dataclass
