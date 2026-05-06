@@ -1,9 +1,13 @@
 import os
 
 STEAM_BOT_TOKEN = os.environ.get("STEAM_BOT_TOKEN", "")
-DEFAULT_STEAM_API_KEY = os.environ.get("STEAM_API_KEY", "")
+DEFAULT_STEAM_API_KEY = os.environ.get("DEFAULT_STEAM_API_KEY", "")
 
-DB_PATH = os.path.join(os.path.dirname(__file__), "..", "steam_watcher.db")
+# DB_PATH: configurable via env var, defaults to local file or Docker path
+DB_PATH = os.environ.get(
+    "DB_PATH",
+    os.path.join(os.path.dirname(__file__), "..", "steam_watcher.db"),
+)
 
 STEAM_API_BASE = "https://api.steampowered.com"
 

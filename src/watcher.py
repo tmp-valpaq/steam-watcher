@@ -1,7 +1,7 @@
 import asyncio
 import logging
 import time
-from typing import List, Optional, Callable, Awaitable
+from typing import List, Optional, Callable, Awaitable, Dict
 
 import aiosqlite
 
@@ -144,12 +144,12 @@ class Watcher:
             await asyncio.sleep(10)
 
     async def _poll_all(self) -> None:
-        """Poll all active targets that are due for a check."""
+        """Poll all active targets that are due for a check using batch API."""
         targets = await db.get_active_targets(self._db)
         now = int(time.time())
 
         # Group by user (API key)
-        user_targets: dict = {}
+        user_targets: Dict[int, List[Target]] = {}
         for target in targets:
             user_targets.setdefault(target.telegram_id, []).append(target)
 
@@ -167,18 +167,38 @@ class Watcher:
                 if not api_key:
                     continue
 
+            # Filter targets that are due for a check
+            due_targets: List[Target] = []
             for target in user_target_list:
                 state = await db.get_target_state(self._db, target.id)
-                # Not due yet (default interval = 30s)
                 if state and (now - state.last_checked) < target.interval_seconds:
                     continue
+                due_targets.append(target)
 
-                await self._check_target(api_key, target)
+            if not due_targets:
+                continue
 
-    async def _check_target(self, api_key: str, target: Target) -> None:
+            # Batch fetch all profiles for this API key in one call
+            steam_ids = [t.steam_id for t in due_targets]
+            profiles = await self._steam.get_player_summaries_batch(api_key, steam_ids)
+
+            # Process each due target
+            for target in due_targets:
+                profile = profiles.get(target.steam_id)
+                if profile is None:
+                    logger.warning("Could not fetch profile for target %s", target.name)
+                    continue
+
+                await self._check_target(api_key, target, profile)
+
+    async def _check_target(
+        self, api_key: str, target: Target, profile=None
+    ) -> None:
+        """Check a single target. If profile is None, fetch it individually."""
         now = int(time.time())
 
-        profile = await self._steam.get_player_summaries(api_key, target.steam_id)
+        if profile is None:
+            profile = await self._steam.get_player_summaries(api_key, target.steam_id)
         if profile is None:
             logger.warning("Could not fetch profile for target %s", target.name)
             return

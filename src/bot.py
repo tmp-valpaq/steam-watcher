@@ -4,7 +4,8 @@ from typing import Optional
 
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message
+from aiogram.types import Message, CallbackQuery
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import aiosqlite
 
@@ -45,7 +46,7 @@ def _help_text() -> str:
         "Команды:\n"
         "/add ссылка — добавить таргет (ник подтянется сам)\n"
         "/remove ссылка — удалить таргет\n"
-        "/list — список таргетов\n"
+        "/list — список таргетов (с кнопками)\n"
         "/pause ссылка — пауза\n"
         "/resume ссылка — возобновить\n"
         "/check ссылка — мгновенная проверка\n"
@@ -89,6 +90,19 @@ def _parse_steam_input(text: str) -> tuple:
         return None, text
 
     return None, None
+
+
+def _build_target_keyboard(target: Target) -> types.InlineKeyboardMarkup:
+    """Build inline keyboard for a single target."""
+    builder = InlineKeyboardBuilder()
+    if target.active:
+        builder.button(text="⏸ Пауза", callback_data=f"pause:{target.id}")
+    else:
+        builder.button(text="▶️ Возобновить", callback_data=f"resume:{target.id}")
+    builder.button(text="🗑 Удалить", callback_data=f"remove:{target.id}")
+    builder.button(text="🔍 Проверить", callback_data=f"check:{target.id}")
+    builder.adjust(3)
+    return builder.as_markup()
 
 
 def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: SteamClient) -> Dispatcher:
@@ -210,7 +224,6 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
             await message.answer("Пока никого не отслеживаешь.\nДобавь: /add ссылка_на_профиль")
             return
 
-        lines = ["Твои таргеты:"]
         for t in targets:
             state = await db.get_target_state(db_conn, t.id)
             status = "Пауза"
@@ -222,9 +235,10 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
                 else:
                     status = "Ещё не проверен"
             marker = "активен" if t.active else "пауза"
-            lines.append(f"  {t.name} [{marker}]: {status}")
+            text = f"{t.name} [{marker}]: {status}"
 
-        await message.answer("\n".join(lines))
+            keyboard = _build_target_keyboard(t)
+            await message.answer(text, reply_markup=keyboard)
 
     @router.message(Command("pause"))
     async def cmd_pause(message: Message) -> None:
@@ -315,9 +329,115 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
         else:
             await message.answer("Не найден.")
 
+    # ── Inline button callback handlers ──────────────────────────
+
+    @router.callback_query(F.data.startswith("pause:"))
+    async def cb_pause(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        # Get target to verify ownership and get steam_id
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
+        await db.set_target_active(db_conn, callback.from_user.id, target.steam_id, False)
+        await callback.answer("Пауза.")
+        # Update the keyboard
+        target.active = False
+        keyboard = _build_target_keyboard(target)
+        state = await db.get_target_state(db_conn, target.id)
+        status = "Пауза"
+        if state:
+            status = state_name(state.persona_state)
+            if state.game_name:
+                status += f", играет: {state.game_name}"
+        marker = "пауза"
+        text = f"{target.name} [{marker}]: {status}"
+        await callback.message.edit_text(text, reply_markup=keyboard)
+
+    @router.callback_query(F.data.startswith("resume:"))
+    async def cb_resume(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
+        await db.set_target_active(db_conn, callback.from_user.id, target.steam_id, True)
+        await callback.answer("Возобновлён.")
+        target.active = True
+        keyboard = _build_target_keyboard(target)
+        state = await db.get_target_state(db_conn, target.id)
+        status = "Ещё не проверен"
+        if state:
+            status = state_name(state.persona_state)
+            if state.game_name:
+                status += f", играет: {state.game_name}"
+        marker = "активен"
+        text = f"{target.name} [{marker}]: {status}"
+        await callback.message.edit_text(text, reply_markup=keyboard)
+
+    @router.callback_query(F.data.startswith("remove:"))
+    async def cb_remove(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
+        await db.remove_target(db_conn, callback.from_user.id, target.steam_id)
+        await callback.answer("Удалён.")
+        await callback.message.edit_text(f"{target.name} — удалён.")
+
+    @router.callback_query(F.data.startswith("check:"))
+    async def cb_check(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
+        user = await db.get_user(db_conn, callback.from_user.id)
+        api_key = _get_api_key(user.steam_api_key if user else None)
+        if not api_key:
+            await callback.answer("Нужен API ключ: /setkey API_КЛЮЧ", show_alert=True)
+            return
+
+        await callback.answer("Проверяю...")
+
+        profile = await steam_client.get_player_summaries(api_key, target.steam_id)
+        if profile is None:
+            await callback.message.answer("Профиль не найден или приватный.")
+            return
+
+        status = state_name(profile.persona_state)
+        lines = [
+            f"{profile.persona_name}",
+            f"Статус: {status}",
+        ]
+        if profile.game_name:
+            lines.append(f"Играет: {profile.game_name}")
+        if profile.last_logoff:
+            lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
+
+        await callback.message.answer("\n".join(lines))
+
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
     return dispatcher
+
+
+async def _get_target_by_id(
+    db_conn: aiosqlite.Connection,
+    telegram_id: int,
+    target_id: int,
+) -> Optional[Target]:
+    """Get a target by ID, verifying it belongs to the given telegram user."""
+    targets = await db.get_targets(db_conn, telegram_id)
+    for t in targets:
+        if t.id == target_id:
+            return t
+    return None
 
 
 async def _resolve_target_id(

@@ -8,9 +8,8 @@ CREATE TABLE IF NOT EXISTS targets (
     telegram_id INTEGER NOT NULL,
     steam_id TEXT NOT NULL,
     name TEXT NOT NULL,
-    interval_seconds INTEGER NOT NULL DEFAULT 300,
+    interval_seconds INTEGER NOT NULL DEFAULT 30,
     active INTEGER NOT NULL DEFAULT 1,
-    FOREIGN KEY (telegram_id) REFERENCES users(telegram_id),
     UNIQUE(telegram_id, steam_id)
 );
 

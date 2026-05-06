@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict, List
 
 import aiohttp
 
@@ -43,24 +43,26 @@ def detect_invisible(
 
 
 class SteamClient:
-    """Steam API client with session reuse and rate limiting."""
+    """Steam API client with session reuse and per-key rate limiting."""
 
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
-        self._last_request_time: float = 0.0
-        self._min_interval: float = 1.0  # 1 req/sec
+        # Per-API-key rate limiting: {api_key: last_request_time}
+        self._last_request_times: Dict[str, float] = {}
+        self._min_interval: float = 1.0  # 1 req/sec per key
 
-    async def _rate_limit(self) -> None:
-        """Ensure we don't exceed 1 request per second."""
+    async def _rate_limit(self, api_key: str) -> None:
+        """Ensure we don't exceed 1 request per second per API key."""
         now = asyncio.get_event_loop().time()
-        elapsed = now - self._last_request_time
+        last = self._last_request_times.get(api_key, 0.0)
+        elapsed = now - last
         if elapsed < self._min_interval:
             await asyncio.sleep(self._min_interval - elapsed)
-        self._last_request_time = asyncio.get_event_loop().time()
+        self._last_request_times[api_key] = asyncio.get_event_loop().time()
 
-    async def _get(self, url: str, params: dict) -> dict:
+    async def _get(self, url: str, params: dict, api_key: str = "") -> dict:
         """Make a rate-limited GET request to the Steam API."""
-        await self._rate_limit()
+        await self._rate_limit(api_key)
         async with self._session.get(url, params=params) as resp:
             resp.raise_for_status()
             return await resp.json()
@@ -75,7 +77,7 @@ class SteamClient:
             "steamids": steam_id,
         }
         try:
-            data = await self._get(url, params)
+            data = await self._get(url, params, api_key=api_key)
             players = data.get("response", {}).get("players", [])
             if not players:
                 return None
@@ -92,6 +94,41 @@ class SteamClient:
             logger.error("Failed to get player summary for %s: %s", steam_id, e)
             return None
 
+    async def get_player_summaries_batch(
+        self, api_key: str, steam_ids: List[str]
+    ) -> Dict[str, SteamProfile]:
+        """
+        Fetch player summaries for multiple Steam IDs in a single request.
+        Steam API supports up to 100 steamids per request (comma-separated).
+        Returns a dict mapping steam_id -> SteamProfile.
+        """
+        if not steam_ids:
+            return {}
+
+        url = f"{STEAM_API_BASE}/ISteamUser/GetPlayerSummaries/v0002/"
+        params = {
+            "key": api_key,
+            "steamids": ",".join(steam_ids),
+        }
+        try:
+            data = await self._get(url, params, api_key=api_key)
+            players = data.get("response", {}).get("players", [])
+            result: Dict[str, SteamProfile] = {}
+            for p in players:
+                sid = str(p["steamid"])
+                result[sid] = SteamProfile(
+                    steam_id=sid,
+                    persona_name=p.get("personaname", "Unknown"),
+                    persona_state=p.get("personastate", 0),
+                    game_id=str(p["gameid"]) if p.get("gameid") else None,
+                    game_name=p.get("gameextrainfo"),
+                    last_logoff=p.get("lastlogoff"),
+                )
+            return result
+        except Exception as e:
+            logger.error("Failed to get batch player summaries: %s", e)
+            return {}
+
     async def get_recently_played(
         self, api_key: str, steam_id: str
     ) -> RecentGames:
@@ -102,7 +139,7 @@ class SteamClient:
             "steamid": steam_id,
         }
         try:
-            data = await self._get(url, params)
+            data = await self._get(url, params, api_key=api_key)
             games_data = data.get("response", {}).get("games", [])
             games = [
                 {
@@ -123,7 +160,7 @@ class SteamClient:
         url = f"{STEAM_API_BASE}/ISteamUser/ResolveVanityURL/v0001/"
         params = {"key": api_key, "vanityurl": vanity}
         try:
-            data = await self._get(url, params)
+            data = await self._get(url, params, api_key=api_key)
             response = data.get("response", {})
             if response.get("success") == 1:
                 return response.get("steamid")
@@ -140,7 +177,7 @@ class SteamClient:
             "steamids": "76561197960287930",  # Gabe's well-known ID
         }
         try:
-            data = await self._get(url, params)
+            data = await self._get(url, params, api_key=api_key)
             # If we get a response without error, the key is valid
             return "response" in data
         except Exception:
