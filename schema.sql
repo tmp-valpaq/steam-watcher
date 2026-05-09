@@ -26,3 +26,25 @@ CREATE TABLE IF NOT EXISTS target_states (
     last_match_time INTEGER,
     FOREIGN KEY (target_id) REFERENCES targets(id)
 );
+
+CREATE TABLE IF NOT EXISTS user_settings (
+    telegram_id INTEGER PRIMARY KEY,
+    daily_summary_enabled INTEGER NOT NULL DEFAULT 1,
+    daily_summary_time TEXT NOT NULL DEFAULT '21:00',
+    session_updates_enabled INTEGER NOT NULL DEFAULT 1,
+    session_update_interval INTEGER NOT NULL DEFAULT 900,
+    privacy_alerts_enabled INTEGER NOT NULL DEFAULT 1,
+    last_summary_date TEXT DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS target_settings (
+    target_id INTEGER PRIMARY KEY,
+    alert_online INTEGER NOT NULL DEFAULT 1,
+    alert_game_start INTEGER NOT NULL DEFAULT 1,
+    alert_invisible INTEGER NOT NULL DEFAULT 1,
+    alert_privacy INTEGER NOT NULL DEFAULT 1,
+    alert_mmr INTEGER NOT NULL DEFAULT 1,
+    alert_session INTEGER NOT NULL DEFAULT 1,
+    alert_name_change INTEGER NOT NULL DEFAULT 1,
+    FOREIGN KEY (target_id) REFERENCES targets(id)
+);

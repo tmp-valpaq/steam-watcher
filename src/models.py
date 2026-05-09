@@ -30,6 +30,12 @@ class TargetState:
     last_checked: int = 0
     last_match_id: Optional[str] = None
     last_match_time: Optional[int] = None
+    # JSON: {appid_str: playtime_minutes_int, ...}
+    game_playtimes: Optional[str] = None
+    visibility_state: int = 3
+    game_start_time: Optional[int] = None
+    last_session_update: Optional[int] = None
+    daily_playtime_snapshot: Optional[str] = None
 
 
 @dataclass
@@ -46,6 +52,7 @@ class SteamProfile:
     game_id: Optional[str] = None
     game_name: Optional[str] = None
     last_logoff: Optional[int] = None
+    visibility_state: int = 3
 
 
 @dataclass
@@ -63,3 +70,14 @@ class RecentGames:
     steam_id: str
     games: list = field(default_factory=list)
     # list of {"appid": int, "name": str, "playtime_forever": int}
+
+
+@dataclass
+class UserSettings:
+    telegram_id: int
+    daily_summary_enabled: bool = True
+    daily_summary_time: str = "21:00"
+    session_updates_enabled: bool = True
+    session_update_interval: int = 900
+    privacy_alerts_enabled: bool = True
+    last_summary_date: str = ""

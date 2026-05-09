@@ -10,6 +10,7 @@ DB_PATH = os.environ.get(
 )
 
 STEAM_API_BASE = "https://api.steampowered.com"
+OPENDOTA_BASE = "https://api.opendota.com/api"
 
 DEFAULT_POLL_INTERVAL = 30  # 30 seconds
 
@@ -21,4 +22,10 @@ PERSONA_STATES = {
     4: "Snooze",
     5: "Looking to Trade",
     6: "Looking to Play",
+}
+
+VISIBILITY_STATES = {
+    1: "Private",
+    2: "Friends Only",
+    3: "Public",
 }

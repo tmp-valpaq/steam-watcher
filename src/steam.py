@@ -89,6 +89,7 @@ class SteamClient:
                 game_id=str(p["gameid"]) if p.get("gameid") else None,
                 game_name=p.get("gameextrainfo"),
                 last_logoff=p.get("lastlogoff"),
+                visibility_state=p.get("communityvisibilitystate", 3),
             )
         except Exception as e:
             logger.error("Failed to get player summary for %s: %s", steam_id, e)
@@ -123,6 +124,7 @@ class SteamClient:
                     game_id=str(p["gameid"]) if p.get("gameid") else None,
                     game_name=p.get("gameextrainfo"),
                     last_logoff=p.get("lastlogoff"),
+                    visibility_state=p.get("communityvisibilitystate", 3),
                 )
             return result
         except Exception as e:

@@ -3,18 +3,38 @@ from typing import Optional, List
 
 import aiosqlite
 
-from .models import User, Target, TargetState
+from .models import User, Target, TargetState, UserSettings
 
 logger = logging.getLogger(__name__)
 
 
 async def init_db(db: aiosqlite.Connection) -> None:
-    """Initialize the database schema from schema.sql."""
+    """Initialize the database schema from schema.sql and add missing columns."""
     import os
     schema_path = os.path.join(os.path.dirname(__file__), "..", "schema.sql")
     async with db.cursor() as cur:
         with open(schema_path, "r") as f:
             await cur.executescript(f.read())
+
+    # Migrate: add columns that may be missing from older DBs
+    _TARGET_STATE_COLUMNS = [
+        ("last_match_id", "TEXT"),
+        ("last_match_time", "INTEGER"),
+        ("game_playtimes", "TEXT"),
+        ("visibility_state", "INTEGER DEFAULT 3"),
+        ("game_start_time", "INTEGER"),
+        ("last_session_update", "INTEGER"),
+        ("daily_playtime_snapshot", "TEXT"),
+    ]
+    async with db.cursor() as cur:
+        # Get existing columns
+        await cur.execute("PRAGMA table_info(target_states)")
+        existing = {row[1] for row in await cur.fetchall()}
+        for col_name, col_type in _TARGET_STATE_COLUMNS:
+            if col_name not in existing:
+                await cur.execute(
+                    f"ALTER TABLE target_states ADD COLUMN {col_name} {col_type}"
+                )
     await db.commit()
 
 
@@ -134,7 +154,9 @@ async def rename_target(
 async def get_target_state(db: aiosqlite.Connection, target_id: int) -> Optional[TargetState]:
     async with db.execute(
         "SELECT target_id, persona_state, persona_name, game_id, game_name, "
-        "playtime_forever, last_logoff, last_checked, last_match_id, last_match_time "
+        "playtime_forever, last_logoff, last_checked, last_match_id, last_match_time, "
+        "game_playtimes, visibility_state, game_start_time, last_session_update, "
+        "daily_playtime_snapshot "
         "FROM target_states WHERE target_id = ?",
         (target_id,),
     ) as cur:
@@ -152,6 +174,11 @@ async def get_target_state(db: aiosqlite.Connection, target_id: int) -> Optional
             last_checked=row[7],
             last_match_id=row[8],
             last_match_time=row[9],
+            game_playtimes=row[10],
+            visibility_state=row[11] if row[11] is not None else 3,
+            game_start_time=row[12],
+            last_session_update=row[13],
+            daily_playtime_snapshot=row[14],
         )
 
 
@@ -159,8 +186,10 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
     await db.execute(
         "INSERT INTO target_states "
         "(target_id, persona_state, persona_name, game_id, game_name, "
-        "playtime_forever, last_logoff, last_checked, last_match_id, last_match_time) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "playtime_forever, last_logoff, last_checked, last_match_id, last_match_time, "
+        "game_playtimes, visibility_state, game_start_time, last_session_update, "
+        "daily_playtime_snapshot) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(target_id) DO UPDATE SET "
         "persona_state = excluded.persona_state, "
         "persona_name = excluded.persona_name, "
@@ -170,7 +199,12 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
         "last_logoff = excluded.last_logoff, "
         "last_checked = excluded.last_checked, "
         "last_match_id = excluded.last_match_id, "
-        "last_match_time = excluded.last_match_time",
+        "last_match_time = excluded.last_match_time, "
+        "game_playtimes = excluded.game_playtimes, "
+        "visibility_state = excluded.visibility_state, "
+        "game_start_time = excluded.game_start_time, "
+        "last_session_update = excluded.last_session_update, "
+        "daily_playtime_snapshot = excluded.daily_playtime_snapshot",
         (
             state.target_id,
             state.persona_state,
@@ -182,6 +216,160 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
             state.last_checked,
             state.last_match_id,
             state.last_match_time,
+            state.game_playtimes,
+            state.visibility_state,
+            state.game_start_time,
+            state.last_session_update,
+            state.daily_playtime_snapshot,
+        ),
+    )
+    await db.commit()
+
+
+# ── UserSettings CRUD ──────────────────────────────────────────────────
+
+async def get_user_settings(db: aiosqlite.Connection, telegram_id: int) -> UserSettings:
+    """Get user settings, returning defaults if not found."""
+    async with db.execute(
+        "SELECT telegram_id, daily_summary_enabled, daily_summary_time, "
+        "session_updates_enabled, session_update_interval, "
+        "privacy_alerts_enabled, last_summary_date "
+        "FROM user_settings WHERE telegram_id = ?",
+        (telegram_id,),
+    ) as cur:
+        row = await cur.fetchone()
+        if row is None:
+            return UserSettings(telegram_id=telegram_id)
+        return UserSettings(
+            telegram_id=row[0],
+            daily_summary_enabled=bool(row[1]),
+            daily_summary_time=row[2],
+            session_updates_enabled=bool(row[3]),
+            session_update_interval=row[4],
+            privacy_alerts_enabled=bool(row[5]),
+            last_summary_date=row[6] or "",
+        )
+
+
+async def save_user_settings(db: aiosqlite.Connection, settings: UserSettings) -> None:
+    """UPSERT user settings."""
+    await db.execute(
+        "INSERT INTO user_settings "
+        "(telegram_id, daily_summary_enabled, daily_summary_time, "
+        "session_updates_enabled, session_update_interval, "
+        "privacy_alerts_enabled, last_summary_date) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(telegram_id) DO UPDATE SET "
+        "daily_summary_enabled = excluded.daily_summary_enabled, "
+        "daily_summary_time = excluded.daily_summary_time, "
+        "session_updates_enabled = excluded.session_updates_enabled, "
+        "session_update_interval = excluded.session_update_interval, "
+        "privacy_alerts_enabled = excluded.privacy_alerts_enabled, "
+        "last_summary_date = excluded.last_summary_date",
+        (
+            settings.telegram_id,
+            1 if settings.daily_summary_enabled else 0,
+            settings.daily_summary_time,
+            1 if settings.session_updates_enabled else 0,
+            settings.session_update_interval,
+            1 if settings.privacy_alerts_enabled else 0,
+            settings.last_summary_date,
+        ),
+    )
+    await db.commit()
+
+
+async def get_users_due_summary(db: aiosqlite.Connection) -> List[tuple]:
+    """Get users whose daily summary is due.
+    Returns list of (telegram_id, daily_summary_time) tuples.
+    """
+    from datetime import datetime
+    now = datetime.now()
+    current_time = now.strftime("%H:%M")
+    today = now.strftime("%Y-%m-%d")
+    async with db.execute(
+        "SELECT telegram_id, daily_summary_time FROM user_settings "
+        "WHERE daily_summary_enabled = 1 "
+        "AND daily_summary_time <= ? "
+        "AND (last_summary_date IS NULL OR last_summary_date != ?)",
+        (current_time, today),
+    ) as cur:
+        return await cur.fetchall()
+
+
+async def mark_summary_sent(db: aiosqlite.Connection, telegram_id: int, date_str: str) -> None:
+    """Mark that a daily summary has been sent for a user on a given date."""
+    await db.execute(
+        "UPDATE user_settings SET last_summary_date = ? WHERE telegram_id = ?",
+        (date_str, telegram_id),
+    )
+    await db.commit()
+
+
+# ── TargetSettings CRUD ──────────────────────────────────────────
+
+_TARGET_SETTINGS_COLUMNS = [
+    "alert_online", "alert_game_start", "alert_invisible",
+    "alert_privacy", "alert_mmr", "alert_session", "alert_name_change",
+]
+
+_TARGET_SETTINGS_DEFAULTS = {
+    "alert_online": True,
+    "alert_game_start": True,
+    "alert_invisible": True,
+    "alert_privacy": True,
+    "alert_mmr": True,
+    "alert_session": True,
+    "alert_name_change": True,
+}
+
+
+async def get_target_settings(db: aiosqlite.Connection, target_id: int) -> dict:
+    """Get target-specific alert settings, returning defaults if not found."""
+    async with db.execute(
+        "SELECT target_id, alert_online, alert_game_start, alert_invisible, "
+        "alert_privacy, alert_mmr, alert_session, alert_name_change "
+        "FROM target_settings WHERE target_id = ?",
+        (target_id,),
+    ) as cur:
+        row = await cur.fetchone()
+        if row is None:
+            return dict(_TARGET_SETTINGS_DEFAULTS)
+        return {
+            "alert_online": bool(row[1]),
+            "alert_game_start": bool(row[2]),
+            "alert_invisible": bool(row[3]),
+            "alert_privacy": bool(row[4]),
+            "alert_mmr": bool(row[5]),
+            "alert_session": bool(row[6]),
+            "alert_name_change": bool(row[7]),
+        }
+
+
+async def save_target_settings(db: aiosqlite.Connection, target_id: int, settings: dict) -> None:
+    """UPSERT target-specific alert settings."""
+    await db.execute(
+        "INSERT INTO target_settings "
+        "(target_id, alert_online, alert_game_start, alert_invisible, "
+        "alert_privacy, alert_mmr, alert_session, alert_name_change) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(target_id) DO UPDATE SET "
+        "alert_online = excluded.alert_online, "
+        "alert_game_start = excluded.alert_game_start, "
+        "alert_invisible = excluded.alert_invisible, "
+        "alert_privacy = excluded.alert_privacy, "
+        "alert_mmr = excluded.alert_mmr, "
+        "alert_session = excluded.alert_session, "
+        "alert_name_change = excluded.alert_name_change",
+        (
+            target_id,
+            1 if settings.get("alert_online", True) else 0,
+            1 if settings.get("alert_game_start", True) else 0,
+            1 if settings.get("alert_invisible", True) else 0,
+            1 if settings.get("alert_privacy", True) else 0,
+            1 if settings.get("alert_mmr", True) else 0,
+            1 if settings.get("alert_session", True) else 0,
+            1 if settings.get("alert_name_change", True) else 0,
         ),
     )
     await db.commit()

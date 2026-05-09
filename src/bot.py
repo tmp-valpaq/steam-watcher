@@ -1,17 +1,19 @@
 import logging
 import re
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Dict, Optional
 
 from aiogram import Bot, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
-from aiogram.types import Message, CallbackQuery
-from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, \
+    ReplyKeyboardRemove, ForceReply
+from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 import aiosqlite
 
 from . import db
 from .config import DEFAULT_STEAM_API_KEY, DEFAULT_POLL_INTERVAL
-from .models import Target, TargetState
+from .models import Target, TargetState, UserSettings
 from .steam import SteamClient, state_name, format_last_seen
 
 logger = logging.getLogger(__name__)
@@ -23,10 +25,27 @@ STEAM_URL_RE = re.compile(
     r"(?:https?://)?steamcommunity\.com/(?:profiles/(\d{17})|id/([a-zA-Z0-9_-]+))"
 )
 
+# Per-user pending states for button-driven flows
+_pending_add: Dict[int, bool] = {}
+
+# OpenDota account_id → SteamID64 conversion
+STEAM_ID64_BASE = 76561197960265728
+
 
 def _get_api_key(user_api_key: Optional[str]) -> Optional[str]:
     """Return user's API key or the server default."""
     return user_api_key or DEFAULT_STEAM_API_KEY or None
+
+
+def _build_main_menu() -> ReplyKeyboardMarkup:
+    """Build the persistent bottom menu with 4 buttons."""
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="➕ Добавить")
+    builder.button(text="📋 Мой список")
+    builder.button(text="🔍 Проверить")
+    builder.button(text="⚙️ Настройки")
+    builder.adjust(2, 2)
+    return builder.as_markup(resize_keyboard=True)
 
 
 def _help_text() -> str:
@@ -40,6 +59,7 @@ def _help_text() -> str:
         "- Начал / перестал играть\n"
         "- Сменил ник\n"
         "- Невидимки (статус offline, но наиграно растёт)\n"
+        "- Изменение видимости профиля\n"
         "\n"
         "Как часто: каждые 30 сек\n"
         "\n"
@@ -92,16 +112,116 @@ def _parse_steam_input(text: str) -> tuple:
     return None, None
 
 
+def _format_playtime(minutes: int) -> str:
+    """Format playtime in minutes to 'Xч Yмин' string."""
+    hours = minutes // 60
+    mins = minutes % 60
+    if hours > 0 and mins > 0:
+        return f"{hours}ч {mins}мин"
+    elif hours > 0:
+        return f"{hours}ч"
+    else:
+        return f"{mins}мин"
+
+
+def _format_duration(seconds: int) -> str:
+    """Format duration in seconds to human-readable string."""
+    if seconds < 60:
+        return f"{seconds}с"
+    minutes = seconds // 60
+    secs = seconds % 60
+    if minutes < 60:
+        return f"{minutes}мин {secs}с"
+    hours = minutes // 60
+    mins = minutes % 60
+    return f"{hours}ч {mins}мин"
+
+
 def _build_target_keyboard(target: Target) -> types.InlineKeyboardMarkup:
     """Build inline keyboard for a single target."""
     builder = InlineKeyboardBuilder()
+    # Row 1: pause/resume + stats + session (3 buttons)
     if target.active:
         builder.button(text="⏸ Пауза", callback_data=f"pause:{target.id}")
     else:
         builder.button(text="▶️ Возобновить", callback_data=f"resume:{target.id}")
+    builder.button(text="📊 Статы", callback_data=f"stats:{target.id}")
+    builder.button(text="⏱ Сессия", callback_data=f"session:{target.id}")
+    # Row 2: alerts settings + delete + check (3 buttons)
+    builder.button(text="⚙️ Алерты", callback_data=f"tset:{target.id}")
     builder.button(text="🗑 Удалить", callback_data=f"remove:{target.id}")
     builder.button(text="🔍 Проверить", callback_data=f"check:{target.id}")
-    builder.adjust(3)
+    builder.adjust(3, 3)
+    return builder.as_markup()
+
+
+def _build_settings_keyboard(settings: UserSettings) -> types.InlineKeyboardMarkup:
+    """Build inline keyboard for user settings."""
+    builder = InlineKeyboardBuilder()
+    summary_label = "✅ ВКЛ" if settings.daily_summary_enabled else "❌ ВЫКЛ"
+    session_label = "✅ ВКЛ" if settings.session_updates_enabled else "❌ ВЫКЛ"
+    privacy_label = "✅ ВКЛ" if settings.privacy_alerts_enabled else "❌ ВЫКЛ"
+    summary_val = "1" if settings.daily_summary_enabled else "0"
+    session_val = "1" if settings.session_updates_enabled else "0"
+    privacy_val = "1" if settings.privacy_alerts_enabled else "0"
+
+    builder.button(text=f"📊 Сводка: {summary_label}", callback_data=f"set_summary:{summary_val}")
+    builder.button(text=f"🕐 Время сводки: {settings.daily_summary_time}", callback_data="set_time:show")
+    builder.button(text=f"⏱ Сессии: {session_label}", callback_data=f"set_session:{session_val}")
+    builder.button(text=f"🔒 Приватность: {privacy_label}", callback_data=f"set_privacy:{privacy_val}")
+    builder.adjust(2, 2)
+    return builder.as_markup()
+
+
+def _build_time_picker_keyboard() -> types.InlineKeyboardMarkup:
+    """Build time picker keyboard with preset times."""
+    builder = InlineKeyboardBuilder()
+    times = ["18:00", "19:00", "20:00", "21:00", "22:00", "23:00"]
+    for t in times:
+        builder.button(text=t, callback_data=f"pick_time:{t}")
+    builder.button(text="🔙 Назад", callback_data="settings:back")
+    builder.adjust(3, 3)
+    return builder.as_markup()
+
+
+def _build_target_settings_keyboard(target_id: int, settings: dict) -> types.InlineKeyboardMarkup:
+    """Build inline keyboard for per-target alert settings."""
+    builder = InlineKeyboardBuilder()
+
+    def _label(key: str, emoji: str, name: str) -> str:
+        val = "✅" if settings.get(key, True) else "❌"
+        return f"{emoji} {name}: {val}"
+
+    builder.button(
+        text=_label("alert_online", "🟢", "Онлайн"),
+        callback_data=f"tset_online:{target_id}:{1 if settings.get('alert_online', True) else 0}",
+    )
+    builder.button(
+        text=_label("alert_game_start", "🎮", "Игра"),
+        callback_data=f"tset_game:{target_id}:{1 if settings.get('alert_game_start', True) else 0}",
+    )
+    builder.button(
+        text=_label("alert_invisible", "👻", "Невидимка"),
+        callback_data=f"tset_invisible:{target_id}:{1 if settings.get('alert_invisible', True) else 0}",
+    )
+    builder.button(
+        text=_label("alert_privacy", "🔒", "Приватность"),
+        callback_data=f"tset_privacy:{target_id}:{1 if settings.get('alert_privacy', True) else 0}",
+    )
+    builder.button(
+        text=_label("alert_mmr", "📊", "MMR Dota"),
+        callback_data=f"tset_mmr:{target_id}:{1 if settings.get('alert_mmr', True) else 0}",
+    )
+    builder.button(
+        text=_label("alert_session", "⏱", "Сессии"),
+        callback_data=f"tset_session:{target_id}:{1 if settings.get('alert_session', True) else 0}",
+    )
+    builder.button(
+        text=_label("alert_name_change", "📝", "Смена ника"),
+        callback_data=f"tset_name:{target_id}:{1 if settings.get('alert_name_change', True) else 0}",
+    )
+    builder.button(text="🔙 Назад", callback_data=f"tset_back:{target_id}")
+    builder.adjust(2, 2, 2, 1, 1)
     return builder.as_markup()
 
 
@@ -109,7 +229,12 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
 
     @router.message(CommandStart())
     async def cmd_start(message: Message) -> None:
-        await message.answer(_help_text())
+        await message.answer(_help_text(), reply_markup=_build_main_menu())
+
+    @router.message(Command("hide"))
+    async def cmd_hide(message: Message) -> None:
+        await message.answer("Меню скрыто. Кнопки /start или /list по-прежнему работают.",
+                             reply_markup=ReplyKeyboardRemove())
 
     @router.message(Command("setkey"))
     async def cmd_setkey(message: Message) -> None:
@@ -132,6 +257,8 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
         await db.save_user(db_conn, user)
         await message.answer("API ключ сохранён. Твои запросы теперь через него.")
 
+    # ── Add target (command) ──────────────────────────────────────
+
     @router.message(Command("add"))
     async def cmd_add(message: Message) -> None:
         parts = message.text.split(maxsplit=1)
@@ -143,6 +270,12 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
             return
 
         input_text = parts[1].strip()
+        await _do_add_target(message, input_text)
+
+    # ── Add target (button flow) ──────────────────────────────────
+
+    async def _do_add_target(message: Message, input_text: str) -> None:
+        """Shared logic for adding a target from text input."""
         steam_id, vanity = _parse_steam_input(input_text)
 
         if not steam_id and not vanity:
@@ -329,6 +462,77 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
         else:
             await message.answer("Не найден.")
 
+    # ── Menu button handlers (specific text matches FIRST) ────────
+
+    @router.message(F.text == "➕ Добавить")
+    async def btn_add(message: Message) -> None:
+        """Handle '➕ Добавить' menu button — set pending state and ask for link."""
+        _pending_add[message.from_user.id] = True
+        await message.answer(
+            "Пришли ссылку на Steam профиль:",
+            reply_markup=ForceReply(selective=True),
+        )
+
+    @router.message(F.text == "📋 Мой список")
+    async def btn_list(message: Message) -> None:
+        """Handle '📋 Мой список' menu button — same as /list."""
+        targets = await db.get_targets(db_conn, message.from_user.id)
+        if not targets:
+            await message.answer("Пока никого не отслеживаешь.\nДобавь: /add ссылка_на_профиль")
+            return
+
+        for t in targets:
+            state = await db.get_target_state(db_conn, t.id)
+            status = "Пауза"
+            if t.active:
+                if state:
+                    status = state_name(state.persona_state)
+                    if state.game_name:
+                        status += f", играет: {state.game_name}"
+                else:
+                    status = "Ещё не проверен"
+            marker = "активен" if t.active else "пауза"
+            text = f"{t.name} [{marker}]: {status}"
+
+            keyboard = _build_target_keyboard(t)
+            await message.answer(text, reply_markup=keyboard)
+
+    @router.message(F.text == "🔍 Проверить")
+    async def btn_check_picker(message: Message) -> None:
+        """Handle '🔍 Проверить' menu button — show targets to pick for instant check."""
+        targets = await db.get_targets(db_conn, message.from_user.id)
+        if not targets:
+            await message.answer("Пока никого не отслеживаешь.")
+            return
+
+        builder = InlineKeyboardBuilder()
+        for t in targets:
+            builder.button(text=t.name, callback_data=f"pick_check:{t.id}")
+        builder.adjust(1)
+        await message.answer("Выбери таргет для проверки:", reply_markup=builder.as_markup())
+
+    @router.message(F.text == "⚙️ Настройки")
+    async def btn_settings(message: Message) -> None:
+        """Handle '⚙️ Настройки' menu button — show settings panel."""
+        settings = await db.get_user_settings(db_conn, message.from_user.id)
+        keyboard = _build_settings_keyboard(settings)
+        await message.answer("⚙️ Настройки:", reply_markup=keyboard)
+
+    # ── Catch-all for pending add flow (AFTER specific handlers) ──
+
+    @router.message(F.text & ~F.text.startswith("/"))
+    async def handle_pending_add(message: Message) -> None:
+        """Catch text messages from users who are in pending state.
+        Must be registered AFTER button handlers so they get priority."""
+        user_id = message.from_user.id
+        input_text = message.text.strip()
+
+        # Steam add flow
+        if _pending_add.get(user_id):
+            _pending_add.pop(user_id, None)
+            await _do_add_target(message, input_text)
+            return
+
     # ── Inline button callback handlers ──────────────────────────
 
     @router.callback_query(F.data.startswith("pause:"))
@@ -421,6 +625,303 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
             lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
 
         await callback.message.answer("\n".join(lines))
+
+    @router.callback_query(F.data.startswith("pick_check:"))
+    async def cb_pick_check(callback: CallbackQuery) -> None:
+        """Handle target selection from the '🔍 Проверить' menu button."""
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
+        user = await db.get_user(db_conn, callback.from_user.id)
+        api_key = _get_api_key(user.steam_api_key if user else None)
+        if not api_key:
+            await callback.answer("Нужен API ключ: /setkey API_КЛЮЧ", show_alert=True)
+            return
+
+        await callback.answer("Проверяю...")
+
+        profile = await steam_client.get_player_summaries(api_key, target.steam_id)
+        if profile is None:
+            await callback.message.edit_text("Профиль не найден или приватный.")
+            return
+
+        status = state_name(profile.persona_state)
+        lines = [
+            f"{profile.persona_name}",
+            f"Статус: {status}",
+        ]
+        if profile.game_name:
+            lines.append(f"Играет: {profile.game_name}")
+        if profile.last_logoff:
+            lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
+
+        await callback.message.edit_text("\n".join(lines))
+
+    @router.callback_query(F.data.startswith("stats:"))
+    async def cb_stats(callback: CallbackQuery) -> None:
+        """Show recent playtime stats for a target."""
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
+        user = await db.get_user(db_conn, callback.from_user.id)
+        api_key = _get_api_key(user.steam_api_key if user else None)
+        if not api_key:
+            await callback.answer("Нужен API ключ: /setkey API_КЛЮЧ", show_alert=True)
+            return
+
+        await callback.answer("Загружаю статистику...")
+
+        # Get current profile info
+        profile = await steam_client.get_player_summaries(api_key, target.steam_id)
+        profile_name = profile.persona_name if profile else target.name
+
+        # Get recently played games
+        recent = await steam_client.get_recently_played(api_key, target.steam_id)
+
+        if not recent.games:
+            await callback.message.answer(
+                f"🎮 {profile_name}\n\n"
+                f"📊 Статистика:\n"
+                f"Нет данных об играх за последние 2 недели."
+            )
+            return
+
+        # Build stats message
+        lines = [f"🎮 {profile_name}", "", "📊 Статистика:"]
+
+        # Current game if playing
+        if profile and profile.game_name:
+            lines.append(f"Сейчас играет: {profile.game_name}")
+
+        lines.append("")
+        lines.append("Последние 2 недели:")
+
+        # Sort by playtime descending and show top 5
+        sorted_games = sorted(recent.games, key=lambda g: g.get("playtime_forever", 0), reverse=True)
+        for game in sorted_games[:5]:
+            playtime = game.get("playtime_forever", 0)
+            lines.append(f"- {game.get('name', 'Unknown')}: {_format_playtime(playtime)} (всего)")
+
+        await callback.message.answer("\n".join(lines))
+
+    @router.callback_query(F.data.startswith("session:"))
+    async def cb_session(callback: CallbackQuery) -> None:
+        """Show current session info for a target."""
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
+        state = await db.get_target_state(db_conn, target.id)
+
+        if not state:
+            await callback.message.answer(
+                f"⏱ {target.name}\n\nДанных пока нет. Подожди первую проверку."
+            )
+            return
+
+        is_playing = state.persona_state > 0 and state.game_name
+        name = state.persona_name or target.name
+
+        if is_playing:
+            lines = [f"⏱ {name}", "", f"Играет: {state.game_name}"]
+
+            # Show session duration if tracked
+            if state.game_start_time:
+                now = int(datetime.now(tz=timezone.utc).timestamp())
+                elapsed = now - state.game_start_time
+                if elapsed > 0:
+                    lines.append(f"Длительность сессии: {_format_duration(elapsed)}")
+
+            # Show last logoff if available for context
+            if state.last_logoff:
+                lines.append(f"Последний выход: {format_last_seen(state.last_logoff)}")
+
+            await callback.message.answer("\n".join(lines))
+        else:
+            lines = [f"⏱ {name}", ""]
+            status = state_name(state.persona_state)
+            lines.append(f"Статус: {status}")
+
+            if state.last_logoff:
+                lines.append(f"Последний онлайн: {format_last_seen(state.last_logoff)}")
+
+            if state.game_name:
+                # Was playing recently (game name stored from last check)
+                lines.append(f"Последняя игра: {state.game_name}")
+
+            await callback.message.answer("\n".join(lines))
+
+    # ── Settings callbacks ────────────────────────────────────────
+
+    @router.callback_query(F.data.startswith("set_summary:"))
+    async def cb_set_summary(callback: CallbackQuery) -> None:
+        """Toggle daily summary setting."""
+        val = callback.data.split(":")[1]
+        telegram_id = callback.from_user.id
+        settings = await db.get_user_settings(db_conn, telegram_id)
+        settings.daily_summary_enabled = val == "1"
+        await db.save_user_settings(db_conn, settings)
+        status = "включена" if settings.daily_summary_enabled else "выключена"
+        await callback.answer(f"Ежедневная сводка {status}.")
+        keyboard = _build_settings_keyboard(settings)
+        await callback.message.edit_text("⚙️ Настройки:", reply_markup=keyboard)
+
+    @router.callback_query(F.data == "set_time:show")
+    async def cb_set_time_show(callback: CallbackQuery) -> None:
+        """Show time picker sub-keyboard."""
+        keyboard = _build_time_picker_keyboard()
+        await callback.message.edit_text("🕐 Выбери время для ежедневной сводки:", reply_markup=keyboard)
+
+    @router.callback_query(F.data.startswith("pick_time:"))
+    async def cb_pick_time(callback: CallbackQuery) -> None:
+        """Set daily summary time from picker."""
+        time_val = callback.data.split(":")[1] + ":" + callback.data.split(":")[2]
+        telegram_id = callback.from_user.id
+        settings = await db.get_user_settings(db_conn, telegram_id)
+        settings.daily_summary_time = time_val
+        await db.save_user_settings(db_conn, settings)
+        await callback.answer(f"Время сводки: {time_val}")
+        keyboard = _build_settings_keyboard(settings)
+        await callback.message.edit_text("⚙️ Настройки:", reply_markup=keyboard)
+
+    @router.callback_query(F.data.startswith("set_session:"))
+    async def cb_set_session(callback: CallbackQuery) -> None:
+        """Toggle session updates setting."""
+        val = callback.data.split(":")[1]
+        telegram_id = callback.from_user.id
+        settings = await db.get_user_settings(db_conn, telegram_id)
+        settings.session_updates_enabled = val == "1"
+        await db.save_user_settings(db_conn, settings)
+        status = "включены" if settings.session_updates_enabled else "выключены"
+        await callback.answer(f"Обновления сессий {status}.")
+        keyboard = _build_settings_keyboard(settings)
+        await callback.message.edit_text("⚙️ Настройки:", reply_markup=keyboard)
+
+    @router.callback_query(F.data.startswith("set_privacy:"))
+    async def cb_set_privacy(callback: CallbackQuery) -> None:
+        """Toggle privacy alerts setting."""
+        val = callback.data.split(":")[1]
+        telegram_id = callback.from_user.id
+        settings = await db.get_user_settings(db_conn, telegram_id)
+        settings.privacy_alerts_enabled = val == "1"
+        await db.save_user_settings(db_conn, settings)
+        status = "включены" if settings.privacy_alerts_enabled else "выключены"
+        await callback.answer(f"Уведомления приватности {status}.")
+        keyboard = _build_settings_keyboard(settings)
+        await callback.message.edit_text("⚙️ Настройки:", reply_markup=keyboard)
+
+    @router.callback_query(F.data == "settings:back")
+    async def cb_settings_back(callback: CallbackQuery) -> None:
+        """Go back to settings menu from time picker."""
+        telegram_id = callback.from_user.id
+        settings = await db.get_user_settings(db_conn, telegram_id)
+        keyboard = _build_settings_keyboard(settings)
+        await callback.message.edit_text("⚙️ Настройки:", reply_markup=keyboard)
+
+    # ── Target alert settings callbacks ────────────────────────────
+
+    async def _show_target_settings(callback: CallbackQuery, target_id: int) -> None:
+        """Show the target alert settings panel."""
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+        settings = await db.get_target_settings(db_conn, target_id)
+        keyboard = _build_target_settings_keyboard(target_id, settings)
+        await callback.message.edit_text(
+            f"⚙️ Алерты для {target.name}:", reply_markup=keyboard
+        )
+
+    @router.callback_query(F.data.startswith("tset:") & ~F.data.startswith("tset_"))
+    async def cb_target_settings(callback: CallbackQuery) -> None:
+        """Open target alert settings panel."""
+        target_id = int(callback.data.split(":")[1])
+        await _show_target_settings(callback, target_id)
+
+    async def _toggle_target_setting(
+        callback: CallbackQuery, target_id: int, setting_key: str, current_val: str
+    ) -> None:
+        """Toggle a single target alert setting."""
+        new_val = current_val == "0"  # toggle: if current is "0", new is True
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+        settings = await db.get_target_settings(db_conn, target_id)
+        settings[setting_key] = new_val
+        await db.save_target_settings(db_conn, target_id, settings)
+        keyboard = _build_target_settings_keyboard(target_id, settings)
+        status = "включены" if new_val else "выключены"
+        await callback.answer(status)
+        await callback.message.edit_text(
+            f"⚙️ Алерты для {target.name}:", reply_markup=keyboard
+        )
+
+    @router.callback_query(F.data.startswith("tset_online:"))
+    async def cb_tset_online(callback: CallbackQuery) -> None:
+        parts = callback.data.split(":")
+        await _toggle_target_setting(callback, int(parts[1]), "alert_online", parts[2])
+
+    @router.callback_query(F.data.startswith("tset_game:"))
+    async def cb_tset_game(callback: CallbackQuery) -> None:
+        parts = callback.data.split(":")
+        await _toggle_target_setting(callback, int(parts[1]), "alert_game_start", parts[2])
+
+    @router.callback_query(F.data.startswith("tset_invisible:"))
+    async def cb_tset_invisible(callback: CallbackQuery) -> None:
+        parts = callback.data.split(":")
+        await _toggle_target_setting(callback, int(parts[1]), "alert_invisible", parts[2])
+
+    @router.callback_query(F.data.startswith("tset_privacy:"))
+    async def cb_tset_privacy(callback: CallbackQuery) -> None:
+        parts = callback.data.split(":")
+        await _toggle_target_setting(callback, int(parts[1]), "alert_privacy", parts[2])
+
+    @router.callback_query(F.data.startswith("tset_mmr:"))
+    async def cb_tset_mmr(callback: CallbackQuery) -> None:
+        parts = callback.data.split(":")
+        await _toggle_target_setting(callback, int(parts[1]), "alert_mmr", parts[2])
+
+    @router.callback_query(F.data.startswith("tset_session:"))
+    async def cb_tset_session(callback: CallbackQuery) -> None:
+        parts = callback.data.split(":")
+        await _toggle_target_setting(callback, int(parts[1]), "alert_session", parts[2])
+
+    @router.callback_query(F.data.startswith("tset_name:"))
+    async def cb_tset_name(callback: CallbackQuery) -> None:
+        parts = callback.data.split(":")
+        await _toggle_target_setting(callback, int(parts[1]), "alert_name_change", parts[2])
+
+    @router.callback_query(F.data.startswith("tset_back:"))
+    async def cb_tset_back(callback: CallbackQuery) -> None:
+        """Go back to target card from target settings."""
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
+        state = await db.get_target_state(db_conn, target.id)
+        status = "Пауза"
+        if target.active:
+            if state:
+                status = state_name(state.persona_state)
+                if state.game_name:
+                    status += f", играет: {state.game_name}"
+            else:
+                status = "Ещё не проверен"
+        marker = "активен" if target.active else "пауза"
+        text = f"{target.name} [{marker}]: {status}"
+        keyboard = _build_target_keyboard(target)
+        await callback.message.edit_text(text, reply_markup=keyboard)
 
     dispatcher = Dispatcher()
     dispatcher.include_router(router)
