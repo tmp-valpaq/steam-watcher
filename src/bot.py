@@ -662,7 +662,7 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
 
     @router.callback_query(F.data.startswith("consistency:"))
     async def cb_consistency(callback: CallbackQuery) -> None:
-        """Show what the bot has tracked — DB state + live OpenDota match check."""
+        """Show tracked activity history + live OpenDota recent matches."""
         target_id = int(callback.data.split(":")[1])
         target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
         if not target:
@@ -676,46 +676,63 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
 
         lines = [f"📊 {name}", ""]
 
-        # 1) Current bot state from DB
+        # 1) Current state
         if state:
             status = state_name(state.persona_state)
             lines.append(f"Статус: {status}")
             if state.game_name and state.persona_state > 0:
                 lines.append(f"Сейчас играет: {state.game_name}")
-            if state.game_name and state.persona_state == 0:
-                lines.append(f"Последняя игра (бот): {state.game_name}")
             if state.last_logoff:
                 lines.append(f"Последний онлайн: {format_last_seen(state.last_logoff)}")
-            lines.append(f"Последняя проверка бота: {format_last_seen(state.last_checked)}")
-
-            # 2) Last Dota 2 match from DB (tracked by OpenDota poll)
-            if state.last_match_id:
-                lines.append("")
-                lines.append(f"Последний Dota 2 матч (бот): {state.last_match_id}")
-                if state.last_match_time:
-                    lines.append(f"  Обнаружен: {format_last_seen(state.last_match_time)}")
         else:
             lines.append("Бот ещё не проверял этого игрока.")
 
-        # 3) Live OpenDota check for latest match
+        # 2) Activity log from DB (bot-tracked events)
+        activity = await db.get_activity_log(db_conn, target.id, limit=10)
+        if activity:
+            lines.append("")
+            lines.append("📜 История (бот):")
+            EVENT_ICONS = {
+                "game_start": "🎮",
+                "game_stop": "⏹",
+                "match": "⚔️",
+                "online": "🟢",
+                "offline": "⚫",
+                "invisible": "👻",
+                "name_change": "📝",
+            }
+            for ev in activity:
+                icon = EVENT_ICONS.get(ev["event_type"], "•")
+                ts = format_last_seen(ev["detected_at"])
+                parts = [f"{icon} {ts}"]
+                if ev["game_name"]:
+                    parts.append(ev["game_name"])
+                if ev["event_type"] == "match":
+                    if ev["hero_name"]:
+                        parts.append(f"({ev['hero_name']})")
+                    if ev["duration_seconds"]:
+                        parts.append(f"{ev['duration_seconds'] // 60}мин")
+                elif ev["details"]:
+                    parts.append(ev["details"])
+                lines.append("  " + " ".join(parts))
+        else:
+            lines.append("")
+            lines.append("История пуста — событий пока не было.")
+
+        # 3) Live OpenDota recent matches
         if match_tracker is not None:
             try:
-                match = await match_tracker.get_last_match(target.steam_id)
-                if match:
+                matches = await match_tracker.get_recent_matches(target.steam_id, limit=3)
+                if matches:
                     lines.append("")
-                    lines.append("Последний матч (OpenDota прямо сейчас):")
-                    lines.append(f"  ID: {match.match_id}")
-                    lines.append(f"  Начало: {format_last_seen(match.start_time)}")
-                    if match.hero_name:
-                        lines.append(f"  Герой: {match.hero_name}")
-                    lines.append(f"  Длительность: {match.duration // 60}мин")
-                    # If bot's last_match_id != what OpenDota says now, highlight
-                    if state and state.last_match_id and state.last_match_id != match.match_id:
-                        lines.append("")
-                        lines.append(f"⚠️ Новый матч найден! Бот ещё не отработал.")
+                    lines.append("🎯 Последние матчи Dota 2 (OpenDota):")
+                    for m in matches:
+                        ts = format_last_seen(m.start_time)
+                        hero = m.hero_name or "?"
+                        dur = f"{m.duration // 60}мин"
+                        lines.append(f"  {ts} — {hero} ({dur})")
             except Exception:
-                lines.append("")
-                lines.append("Не удалось запросить OpenDota.")
+                pass
 
         await callback.message.answer("\n".join(lines))
 

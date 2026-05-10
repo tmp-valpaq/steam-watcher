@@ -96,6 +96,39 @@ class MatchTracker:
             logger.error("Failed to get last match for %s: %s", steam_id, e)
             return None
 
+    async def get_recent_matches(self, steam_id: str, limit: int = 5) -> List[MatchInfo]:
+        """Fetch recent Dota 2 matches for a Steam ID."""
+        account_id = self._to_account_id(steam_id)
+        if account_id is None or account_id <= 0:
+            return []
+
+        url = f"{OPENDOTA_API_BASE}/players/{account_id}/matches?limit={limit}"
+        try:
+            data = await self._get(url)
+            if not isinstance(data, list) or not data:
+                return []
+            matches = []
+            for m in data:
+                match_id = m.get("match_id")
+                start_time = m.get("start_time")
+                duration = m.get("duration")
+                hero_id = m.get("hero_id")
+                if match_id is None or start_time is None or duration is None:
+                    continue
+                hero_name = await self._get_hero_name(hero_id) if hero_id else None
+                matches.append(MatchInfo(
+                    match_id=str(match_id),
+                    steam_id=steam_id,
+                    game="dota2",
+                    start_time=int(start_time),
+                    duration=int(duration),
+                    hero_name=hero_name,
+                ))
+            return matches
+        except Exception as e:
+            logger.error("Failed to get recent matches for %s: %s", steam_id, e)
+            return []
+
     async def get_last_matches_batch(
         self, steam_ids: List[str]
     ) -> Dict[str, MatchInfo]:

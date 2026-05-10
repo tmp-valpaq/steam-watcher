@@ -48,3 +48,19 @@ CREATE TABLE IF NOT EXISTS target_settings (
     alert_name_change INTEGER NOT NULL DEFAULT 1,
     FOREIGN KEY (target_id) REFERENCES targets(id)
 );
+
+-- Activity log: every detected event with timestamp
+-- type: game_start, game_stop, match, online, offline, invisible, name_change
+CREATE TABLE IF NOT EXISTS activity_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_id INTEGER NOT NULL,
+    event_type TEXT NOT NULL,
+    game_name TEXT,
+    match_id TEXT,
+    hero_name TEXT,
+    duration_seconds INTEGER,
+    details TEXT,
+    detected_at INTEGER NOT NULL,
+    FOREIGN KEY (target_id) REFERENCES targets(id)
+);
+CREATE INDEX IF NOT EXISTS idx_activity_log_target ON activity_log(target_id, detected_at DESC);

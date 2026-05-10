@@ -452,7 +452,56 @@ class Watcher:
             except Exception as e:
                 logger.error("Failed to send alert: %s", e)
 
+        # Log activity events for history tracking
+        await self._log_activity_from_alerts(target, alerts, previous_state, current_state)
+
         await db.save_target_state(self._db, current_state)
+
+    async def _log_activity_from_alerts(
+        self, target: Target, alerts: List[Alert], prev: Optional[TargetState], curr: TargetState,
+    ) -> None:
+        """Persist key state-change events to activity_log based on generated alerts."""
+        now = int(time.time())
+        for alert in alerts:
+            msg = alert.message
+            event_type = None
+            game_name = None
+            details = None
+
+            if "зашёл онлайн" in msg:
+                event_type = "online"
+            elif "вышел оффлайн" in msg:
+                event_type = "offline"
+            elif "начал играть" in msg:
+                event_type = "game_start"
+                game_name = curr.game_name
+            elif "перестал играть" in msg:
+                event_type = "game_stop"
+                # Extract game name from the alert message
+                if prev and prev.game_name:
+                    game_name = prev.game_name
+                # Compute session duration
+                if prev and prev.game_start_time:
+                    elapsed = now - prev.game_start_time
+                    if elapsed > 0:
+                        details = format_duration_seconds(elapsed)
+            elif "сменил ник" in msg:
+                event_type = "name_change"
+                if prev:
+                    details = f"{prev.persona_name} → {curr.persona_name}"
+            elif "НЕВИДИМКА" in msg:
+                event_type = "invisible"
+                if game_name is None and curr.game_name:
+                    game_name = curr.game_name
+
+            if event_type:
+                try:
+                    await db.save_activity(
+                        self._db, target.id, event_type,
+                        game_name=game_name, details=details, detected_at=now,
+                    )
+                except Exception as e:
+                    logger.error("Failed to log activity: %s", e)
 
     @staticmethod
     def _detect_grown_games(
@@ -705,6 +754,19 @@ class Watcher:
             state.last_match_id = match.match_id
             state.last_match_time = now
             await db.save_target_state(self._db, state)
+
+            # Log match to activity history
+            try:
+                await db.save_activity(
+                    self._db, target.id, "match",
+                    game_name="Dota 2",
+                    match_id=match.match_id,
+                    hero_name=match.hero_name,
+                    duration_seconds=match.duration,
+                    detected_at=now,
+                )
+            except Exception as e:
+                logger.error("Failed to log match activity: %s", e)
 
             time_ago = format_time_ago(match.start_time)
             message = (

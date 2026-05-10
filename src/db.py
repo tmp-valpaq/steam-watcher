@@ -346,6 +346,65 @@ async def get_target_settings(db: aiosqlite.Connection, target_id: int) -> dict:
         }
 
 
+# ── ActivityLog ──────────────────────────────────────────────────────
+
+async def save_activity(
+    db: aiosqlite.Connection,
+    target_id: int,
+    event_type: str,
+    *,
+    game_name: str = None,
+    match_id: str = None,
+    hero_name: str = None,
+    duration_seconds: int = None,
+    details: str = None,
+    detected_at: int = None,
+) -> None:
+    """Log a detected activity event. detected_at defaults to now."""
+    if detected_at is None:
+        import time
+        detected_at = int(time.time())
+    await db.execute(
+        "INSERT INTO activity_log "
+        "(target_id, event_type, game_name, match_id, hero_name, duration_seconds, details, detected_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (target_id, event_type, game_name, match_id, hero_name, duration_seconds, details, detected_at),
+    )
+    await db.commit()
+
+
+async def get_activity_log(
+    db: aiosqlite.Connection,
+    target_id: int,
+    limit: int = 20,
+    event_types: list = None,
+) -> list:
+    """Get recent activity log entries, newest first.
+    Returns list of dicts with keys matching the columns."""
+    query = (
+        "SELECT id, event_type, game_name, match_id, hero_name, "
+        "duration_seconds, details, detected_at "
+        "FROM activity_log WHERE target_id = ?"
+    )
+    params: list = [target_id]
+    if event_types:
+        placeholders = ",".join("?" for _ in event_types)
+        query += f" AND event_type IN ({placeholders})"
+        params.extend(event_types)
+    query += " ORDER BY detected_at DESC LIMIT ?"
+    params.append(limit)
+
+    cols = ["id", "event_type", "game_name", "match_id", "hero_name",
+            "duration_seconds", "details", "detected_at"]
+    rows = []
+    async with db.execute(query, params) as cur:
+        async for row in cur:
+            rows.append(dict(zip(cols, row)))
+    return rows
+
+
+# ── TargetSettings CRUD ──────────────────────────────────────────
+
 async def save_target_settings(db: aiosqlite.Connection, target_id: int, settings: dict) -> None:
     """UPSERT target-specific alert settings."""
     await db.execute(
