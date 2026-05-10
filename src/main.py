@@ -51,7 +51,7 @@ async def main() -> None:
             await watcher.start()
 
             # Setup and start bot dispatcher
-            dispatcher = setup_bot(bot, db_conn, steam_client)
+            dispatcher = setup_bot(bot, db_conn, steam_client, match_tracker)
 
             try:
                 logger.info("Starting Steam Watcher bot...")

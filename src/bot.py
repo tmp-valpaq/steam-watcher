@@ -145,7 +145,7 @@ def _build_target_keyboard(target: Target) -> types.InlineKeyboardMarkup:
         builder.button(text="⏸ Пауза", callback_data=f"pause:{target.id}")
     else:
         builder.button(text="▶️ Возобновить", callback_data=f"resume:{target.id}")
-    builder.button(text="📊 Статы", callback_data=f"stats:{target.id}")
+    builder.button(text="📊 Консистентность", callback_data=f"consistency:{target.id}")
     builder.button(text="⏱ Сессия", callback_data=f"session:{target.id}")
     # Row 2: alerts settings + delete + check (3 buttons)
     builder.button(text="⚙️ Алерты", callback_data=f"tset:{target.id}")
@@ -225,7 +225,7 @@ def _build_target_settings_keyboard(target_id: int, settings: dict) -> types.Inl
     return builder.as_markup()
 
 
-def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: SteamClient) -> Dispatcher:
+def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: SteamClient, match_tracker=None) -> Dispatcher:
 
     @router.message(CommandStart())
     async def cmd_start(message: Message) -> None:
@@ -660,53 +660,62 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
 
         await callback.message.edit_text("\n".join(lines))
 
-    @router.callback_query(F.data.startswith("stats:"))
-    async def cb_stats(callback: CallbackQuery) -> None:
-        """Show recent playtime stats for a target."""
+    @router.callback_query(F.data.startswith("consistency:"))
+    async def cb_consistency(callback: CallbackQuery) -> None:
+        """Show what the bot has tracked — DB state + live OpenDota match check."""
         target_id = int(callback.data.split(":")[1])
         target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
         if not target:
             await callback.answer("Не найден.", show_alert=True)
             return
 
-        user = await db.get_user(db_conn, callback.from_user.id)
-        api_key = _get_api_key(user.steam_api_key if user else None)
-        if not api_key:
-            await callback.answer("Нужен API ключ: /setkey API_КЛЮЧ", show_alert=True)
-            return
+        await callback.answer("Проверяю...")
 
-        await callback.answer("Загружаю статистику...")
+        state = await db.get_target_state(db_conn, target.id)
+        name = state.persona_name if state else target.name
 
-        # Get current profile info
-        profile = await steam_client.get_player_summaries(api_key, target.steam_id)
-        profile_name = profile.persona_name if profile else target.name
+        lines = [f"📊 {name}", ""]
 
-        # Get recently played games
-        recent = await steam_client.get_recently_played(api_key, target.steam_id)
+        # 1) Current bot state from DB
+        if state:
+            status = state_name(state.persona_state)
+            lines.append(f"Статус: {status}")
+            if state.game_name and state.persona_state > 0:
+                lines.append(f"Сейчас играет: {state.game_name}")
+            if state.game_name and state.persona_state == 0:
+                lines.append(f"Последняя игра (бот): {state.game_name}")
+            if state.last_logoff:
+                lines.append(f"Последний онлайн: {format_last_seen(state.last_logoff)}")
+            lines.append(f"Последняя проверка бота: {format_last_seen(state.last_checked)}")
 
-        if not recent.games:
-            await callback.message.answer(
-                f"🎮 {profile_name}\n\n"
-                f"📊 Статистика:\n"
-                f"Нет данных об играх за последние 2 недели."
-            )
-            return
+            # 2) Last Dota 2 match from DB (tracked by OpenDota poll)
+            if state.last_match_id:
+                lines.append("")
+                lines.append(f"Последний Dota 2 матч (бот): {state.last_match_id}")
+                if state.last_match_time:
+                    lines.append(f"  Обнаружен: {format_last_seen(state.last_match_time)}")
+        else:
+            lines.append("Бот ещё не проверял этого игрока.")
 
-        # Build stats message
-        lines = [f"🎮 {profile_name}", "", "📊 Статистика:"]
-
-        # Current game if playing
-        if profile and profile.game_name:
-            lines.append(f"Сейчас играет: {profile.game_name}")
-
-        lines.append("")
-        lines.append("Последние 2 недели:")
-
-        # Sort by playtime descending and show top 5
-        sorted_games = sorted(recent.games, key=lambda g: g.get("playtime_forever", 0), reverse=True)
-        for game in sorted_games[:5]:
-            playtime = game.get("playtime_forever", 0)
-            lines.append(f"- {game.get('name', 'Unknown')}: {_format_playtime(playtime)} (всего)")
+        # 3) Live OpenDota check for latest match
+        if match_tracker is not None:
+            try:
+                match = await match_tracker.get_last_match(target.steam_id)
+                if match:
+                    lines.append("")
+                    lines.append("Последний матч (OpenDota прямо сейчас):")
+                    lines.append(f"  ID: {match.match_id}")
+                    lines.append(f"  Начало: {format_last_seen(match.start_time)}")
+                    if match.hero_name:
+                        lines.append(f"  Герой: {match.hero_name}")
+                    lines.append(f"  Длительность: {match.duration // 60}мин")
+                    # If bot's last_match_id != what OpenDota says now, highlight
+                    if state and state.last_match_id and state.last_match_id != match.match_id:
+                        lines.append("")
+                        lines.append(f"⚠️ Новый матч найден! Бот ещё не отработал.")
+            except Exception:
+                lines.append("")
+                lines.append("Не удалось запросить OpenDota.")
 
         await callback.message.answer("\n".join(lines))
 
