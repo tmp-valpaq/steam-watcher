@@ -6,7 +6,7 @@ from typing import Optional, Dict, List
 import aiohttp
 
 from .config import STEAM_API_BASE, PERSONA_STATES
-from .models import SteamProfile, RecentGames
+from .models import SteamProfile
 
 logger = logging.getLogger(__name__)
 
@@ -130,32 +130,6 @@ class SteamClient:
         except Exception as e:
             logger.error("Failed to get batch player summaries: %s", e)
             return {}
-
-    async def get_recently_played(
-        self, api_key: str, steam_id: str
-    ) -> RecentGames:
-        """Fetch recently played games for a Steam ID."""
-        url = f"{STEAM_API_BASE}/IPlayerService/GetRecentlyPlayedGames/v0001/"
-        params = {
-            "key": api_key,
-            "steamid": steam_id,
-        }
-        try:
-            data = await self._get(url, params, api_key=api_key)
-            games_data = data.get("response", {}).get("games", [])
-            games = [
-                {
-                    "appid": g["appid"],
-                    "name": g.get("name", "Unknown"),
-                    "playtime_forever": g.get("playtime_forever", 0),
-                }
-                for g in games_data
-            ]
-            total = data.get("response", {}).get("total_count", len(games))
-            return RecentGames(steam_id=steam_id, games=games)
-        except Exception as e:
-            logger.error("Failed to get recently played for %s: %s", steam_id, e)
-            return RecentGames(steam_id=steam_id, games=[])
 
     async def resolve_vanity_url(self, api_key: str, vanity: str) -> Optional[str]:
         """Resolve a vanity URL name to a SteamID64."""

@@ -333,25 +333,25 @@ class Watcher:
             logger.warning("Could not fetch profile for target %s", target.name)
             return
 
-        recent = await self._steam.get_recently_played(api_key, target.steam_id)
-
-        total_playtime = sum(g["playtime_forever"] for g in recent.games) if recent.games else 0
-
-        # Build per-game playtime map: {appid_str: minutes}
-        current_game_pts = {}
-        if recent.games:
-            for g in recent.games:
-                current_game_pts[str(g["appid"])] = g["playtime_forever"]
-
         previous_state = await db.get_target_state(self._db, target.id)
 
-        # Parse previous per-game playtimes
+        # Parse previous per-game playtimes (our own tracking, not Steam's unreliable API)
         prev_game_pts = {}
         if previous_state and previous_state.game_playtimes:
             try:
                 prev_game_pts = json.loads(previous_state.game_playtimes)
             except (json.JSONDecodeError, TypeError):
                 pass
+
+        # Start current playtimes from previous; increment for the actively playing game
+        current_game_pts = dict(prev_game_pts)
+        if profile.game_id and profile.persona_state > 0:
+            appid = str(profile.game_id)
+            interval_minutes = target.interval_seconds // 60
+            if interval_minutes > 0:
+                current_game_pts[appid] = current_game_pts.get(appid, 0) + interval_minutes
+
+        total_playtime = sum(current_game_pts.values())
 
         # Determine game_start_time:
         # If target just started playing (new game, wasn't playing before), set start time
