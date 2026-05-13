@@ -34,7 +34,8 @@ CREATE TABLE IF NOT EXISTS user_settings (
     session_updates_enabled INTEGER NOT NULL DEFAULT 1,
     session_update_interval INTEGER NOT NULL DEFAULT 900,
     privacy_alerts_enabled INTEGER NOT NULL DEFAULT 1,
-    last_summary_date TEXT DEFAULT ''
+    last_summary_date TEXT DEFAULT '',
+    timezone TEXT NOT NULL DEFAULT 'UTC'
 );
 
 CREATE TABLE IF NOT EXISTS target_settings (

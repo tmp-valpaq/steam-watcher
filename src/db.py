@@ -35,6 +35,14 @@ async def init_db(db: aiosqlite.Connection) -> None:
                 await cur.execute(
                     f"ALTER TABLE target_states ADD COLUMN {col_name} {col_type}"
                 )
+
+        # Migrate user_settings: add timezone column if missing
+        await cur.execute("PRAGMA table_info(user_settings)")
+        existing_us = {row[1] for row in await cur.fetchall()}
+        if "timezone" not in existing_us:
+            await cur.execute(
+                "ALTER TABLE user_settings ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'"
+            )
     await db.commit()
 
 
@@ -249,7 +257,7 @@ async def get_user_settings(db: aiosqlite.Connection, telegram_id: int) -> UserS
     async with db.execute(
         "SELECT telegram_id, daily_summary_enabled, daily_summary_time, "
         "session_updates_enabled, session_update_interval, "
-        "privacy_alerts_enabled, last_summary_date "
+        "privacy_alerts_enabled, last_summary_date, timezone "
         "FROM user_settings WHERE telegram_id = ?",
         (telegram_id,),
     ) as cur:
@@ -264,6 +272,7 @@ async def get_user_settings(db: aiosqlite.Connection, telegram_id: int) -> UserS
             session_update_interval=row[4],
             privacy_alerts_enabled=bool(row[5]),
             last_summary_date=row[6] or "",
+            timezone=row[7] or "UTC",
         )
 
 
@@ -273,15 +282,16 @@ async def save_user_settings(db: aiosqlite.Connection, settings: UserSettings) -
         "INSERT INTO user_settings "
         "(telegram_id, daily_summary_enabled, daily_summary_time, "
         "session_updates_enabled, session_update_interval, "
-        "privacy_alerts_enabled, last_summary_date) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "privacy_alerts_enabled, last_summary_date, timezone) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(telegram_id) DO UPDATE SET "
         "daily_summary_enabled = excluded.daily_summary_enabled, "
         "daily_summary_time = excluded.daily_summary_time, "
         "session_updates_enabled = excluded.session_updates_enabled, "
         "session_update_interval = excluded.session_update_interval, "
         "privacy_alerts_enabled = excluded.privacy_alerts_enabled, "
-        "last_summary_date = excluded.last_summary_date",
+        "last_summary_date = excluded.last_summary_date, "
+        "timezone = excluded.timezone",
         (
             settings.telegram_id,
             1 if settings.daily_summary_enabled else 0,
@@ -290,27 +300,38 @@ async def save_user_settings(db: aiosqlite.Connection, settings: UserSettings) -
             settings.session_update_interval,
             1 if settings.privacy_alerts_enabled else 0,
             settings.last_summary_date,
+            settings.timezone,
         ),
     )
     await db.commit()
 
 
 async def get_users_due_summary(db: aiosqlite.Connection) -> List[tuple]:
-    """Get users whose daily summary is due.
-    Returns list of (telegram_id, daily_summary_time) tuples.
+    """Get users whose daily summary is due, evaluated in each user's timezone.
+    Returns list of (telegram_id, daily_summary_time, timezone) tuples.
     """
-    from datetime import datetime
-    now = datetime.now()
-    current_time = now.strftime("%H:%M")
-    today = now.strftime("%Y-%m-%d")
+    from datetime import datetime, timezone as dt_timezone
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    now_utc = datetime.now(tz=dt_timezone.utc)
     async with db.execute(
-        "SELECT telegram_id, daily_summary_time FROM user_settings "
-        "WHERE daily_summary_enabled = 1 "
-        "AND daily_summary_time <= ? "
-        "AND (last_summary_date IS NULL OR last_summary_date != ?)",
-        (current_time, today),
+        "SELECT telegram_id, daily_summary_time, timezone, last_summary_date "
+        "FROM user_settings WHERE daily_summary_enabled = 1"
     ) as cur:
-        return await cur.fetchall()
+        rows = await cur.fetchall()
+
+    due: List[tuple] = []
+    for telegram_id, summary_time, tz_name, last_summary_date in rows:
+        try:
+            tz = ZoneInfo(tz_name or "UTC")
+        except ZoneInfoNotFoundError:
+            tz = ZoneInfo("UTC")
+        now_local = now_utc.astimezone(tz)
+        current_time = now_local.strftime("%H:%M")
+        today = now_local.strftime("%Y-%m-%d")
+        if summary_time <= current_time and (last_summary_date or "") != today:
+            due.append((telegram_id, summary_time, tz_name or "UTC"))
+    return due
 
 
 async def mark_summary_sent(db: aiosqlite.Connection, telegram_id: int, date_str: str) -> None:

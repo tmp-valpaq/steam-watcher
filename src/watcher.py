@@ -4,7 +4,9 @@ import logging
 import time
 from datetime import datetime, timezone
 from typing import List, Optional, Callable, Awaitable, Dict
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import aiohttp
 import aiosqlite
 
 from . import db
@@ -216,6 +218,9 @@ class Watcher:
         self._steam = steam_client
         self._send_alert = send_alert
         self._match_tracker = match_tracker
+        self._http_session: Optional[aiohttp.ClientSession] = (
+            match_tracker._session if match_tracker is not None else None
+        )
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._last_match_poll: float = 0.0
@@ -588,10 +593,15 @@ class Watcher:
         if not users:
             return
 
-        today_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        now_utc = datetime.now(tz=timezone.utc)
 
-        for telegram_id, summary_time in users:
+        for telegram_id, summary_time, tz_name in users:
             try:
+                try:
+                    user_tz = ZoneInfo(tz_name)
+                except ZoneInfoNotFoundError:
+                    user_tz = ZoneInfo("UTC")
+                today_str = now_utc.astimezone(user_tz).strftime("%Y-%m-%d")
                 targets = await db.get_targets(self._db, telegram_id)
                 if not targets:
                     await db.mark_summary_sent(self._db, telegram_id, today_str)
@@ -685,18 +695,21 @@ class Watcher:
             self._opendota_rank_cache.clear()
             self._opendota_cache_ttl = now + 600
 
+        if self._http_session is None:
+            return None
+
         try:
-            import aiohttp
             from .match_tracker import STEAM_ID_OFFSET
 
             account_id = int(steam_id) - STEAM_ID_OFFSET
             url = f"https://api.opendota.com/api/players/{account_id}"
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                    if resp.status != 200:
-                        return None
-                    data = await resp.json()
+            async with self._http_session.get(
+                url, timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
 
             mmr = data.get("mmr_estimate", {}).get("estimate")
             rank_tier = data.get("rank_tier")

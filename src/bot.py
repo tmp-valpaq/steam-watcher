@@ -31,6 +31,18 @@ _pending_add: Dict[int, bool] = {}
 # OpenDota account_id → SteamID64 conversion
 STEAM_ID64_BASE = 76561197960265728
 
+# Common timezones offered in the settings picker. Stdlib zoneinfo names.
+TIMEZONES = [
+    "UTC",
+    "Europe/Moscow",
+    "Europe/Kiev",
+    "Europe/Berlin",
+    "Europe/London",
+    "US/Eastern",
+    "US/Pacific",
+    "Asia/Tokyo",
+]
+
 
 def _get_api_key(user_api_key: Optional[str]) -> Optional[str]:
     """Return user's API key or the server default."""
@@ -167,10 +179,16 @@ def _build_settings_keyboard(settings: UserSettings) -> types.InlineKeyboardMark
 
     builder.button(text=f"📊 Сводка: {summary_label}", callback_data=f"set_summary:{summary_val}")
     builder.button(text=f"🕐 Время сводки: {settings.daily_summary_time}", callback_data="set_time:show")
+    builder.button(text=f"🌐 Часовой пояс: {settings.timezone}", callback_data="set_tz:show")
     builder.button(text=f"⏱ Сессии: {session_label}", callback_data=f"set_session:{session_val}")
     builder.button(text=f"🔒 Приватность: {privacy_label}", callback_data=f"set_privacy:{privacy_val}")
-    builder.adjust(2, 2)
+    builder.adjust(2, 1, 2)
     return builder.as_markup()
+
+
+def _settings_panel_text(settings: UserSettings) -> str:
+    """Header for the settings panel showing the active timezone."""
+    return f"⚙️ Настройки ({settings.timezone}):"
 
 
 def _build_time_picker_keyboard() -> types.InlineKeyboardMarkup:
@@ -181,6 +199,17 @@ def _build_time_picker_keyboard() -> types.InlineKeyboardMarkup:
         builder.button(text=t, callback_data=f"pick_time:{t}")
     builder.button(text="🔙 Назад", callback_data="settings:back")
     builder.adjust(3, 3)
+    return builder.as_markup()
+
+
+def _build_tz_picker_keyboard(current_tz: str) -> types.InlineKeyboardMarkup:
+    """Build timezone picker keyboard with preset zones."""
+    builder = InlineKeyboardBuilder()
+    for tz in TIMEZONES:
+        marker = "✅ " if tz == current_tz else ""
+        builder.button(text=f"{marker}{tz}", callback_data=f"pick_tz:{tz}")
+    builder.button(text="🔙 Назад", callback_data="settings:back")
+    builder.adjust(2, 2, 2, 2, 1)
     return builder.as_markup()
 
 
@@ -516,7 +545,7 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
         """Handle '⚙️ Настройки' menu button — show settings panel."""
         settings = await db.get_user_settings(db_conn, message.from_user.id)
         keyboard = _build_settings_keyboard(settings)
-        await message.answer("⚙️ Настройки:", reply_markup=keyboard)
+        await message.answer(_settings_panel_text(settings), reply_markup=keyboard)
 
     # ── Catch-all for pending add flow (AFTER specific handlers) ──
 
@@ -798,7 +827,7 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
         status = "включена" if settings.daily_summary_enabled else "выключена"
         await callback.answer(f"Ежедневная сводка {status}.")
         keyboard = _build_settings_keyboard(settings)
-        await callback.message.edit_text("⚙️ Настройки:", reply_markup=keyboard)
+        await callback.message.edit_text(_settings_panel_text(settings), reply_markup=keyboard)
 
     @router.callback_query(F.data == "set_time:show")
     async def cb_set_time_show(callback: CallbackQuery) -> None:
@@ -816,7 +845,32 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
         await db.save_user_settings(db_conn, settings)
         await callback.answer(f"Время сводки: {time_val}")
         keyboard = _build_settings_keyboard(settings)
-        await callback.message.edit_text("⚙️ Настройки:", reply_markup=keyboard)
+        await callback.message.edit_text(_settings_panel_text(settings), reply_markup=keyboard)
+
+    @router.callback_query(F.data == "set_tz:show")
+    async def cb_set_tz_show(callback: CallbackQuery) -> None:
+        """Show timezone picker sub-keyboard."""
+        telegram_id = callback.from_user.id
+        settings = await db.get_user_settings(db_conn, telegram_id)
+        keyboard = _build_tz_picker_keyboard(settings.timezone)
+        await callback.message.edit_text(
+            "🌐 Выбери часовой пояс:", reply_markup=keyboard
+        )
+
+    @router.callback_query(F.data.startswith("pick_tz:"))
+    async def cb_pick_tz(callback: CallbackQuery) -> None:
+        """Set user timezone from picker."""
+        tz_val = callback.data.split(":", 1)[1]
+        if tz_val not in TIMEZONES:
+            await callback.answer("Неизвестный часовой пояс.", show_alert=True)
+            return
+        telegram_id = callback.from_user.id
+        settings = await db.get_user_settings(db_conn, telegram_id)
+        settings.timezone = tz_val
+        await db.save_user_settings(db_conn, settings)
+        await callback.answer(f"Часовой пояс: {tz_val}")
+        keyboard = _build_settings_keyboard(settings)
+        await callback.message.edit_text(_settings_panel_text(settings), reply_markup=keyboard)
 
     @router.callback_query(F.data.startswith("set_session:"))
     async def cb_set_session(callback: CallbackQuery) -> None:
@@ -829,7 +883,7 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
         status = "включены" if settings.session_updates_enabled else "выключены"
         await callback.answer(f"Обновления сессий {status}.")
         keyboard = _build_settings_keyboard(settings)
-        await callback.message.edit_text("⚙️ Настройки:", reply_markup=keyboard)
+        await callback.message.edit_text(_settings_panel_text(settings), reply_markup=keyboard)
 
     @router.callback_query(F.data.startswith("set_privacy:"))
     async def cb_set_privacy(callback: CallbackQuery) -> None:
@@ -842,7 +896,7 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
         status = "включены" if settings.privacy_alerts_enabled else "выключены"
         await callback.answer(f"Уведомления приватности {status}.")
         keyboard = _build_settings_keyboard(settings)
-        await callback.message.edit_text("⚙️ Настройки:", reply_markup=keyboard)
+        await callback.message.edit_text(_settings_panel_text(settings), reply_markup=keyboard)
 
     @router.callback_query(F.data == "settings:back")
     async def cb_settings_back(callback: CallbackQuery) -> None:
@@ -850,7 +904,7 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
         telegram_id = callback.from_user.id
         settings = await db.get_user_settings(db_conn, telegram_id)
         keyboard = _build_settings_keyboard(settings)
-        await callback.message.edit_text("⚙️ Настройки:", reply_markup=keyboard)
+        await callback.message.edit_text(_settings_panel_text(settings), reply_markup=keyboard)
 
     # ── Target alert settings callbacks ────────────────────────────
 

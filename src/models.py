@@ -81,3 +81,4 @@ class UserSettings:
     session_update_interval: int = 900
     privacy_alerts_enabled: bool = True
     last_summary_date: str = ""
+    timezone: str = "UTC"
