@@ -254,7 +254,7 @@ def _build_target_settings_keyboard(target_id: int, settings: dict) -> types.Inl
     return builder.as_markup()
 
 
-def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: SteamClient, match_tracker=None) -> Dispatcher:
+def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: SteamClient, match_tracker=None, watcher=None) -> Dispatcher:
 
     @router.message(CommandStart())
     async def cmd_start(message: Message) -> None:
@@ -748,10 +748,10 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
             lines.append("")
             lines.append("История пуста — событий пока не было.")
 
-        # 3) Live OpenDota recent matches
-        if match_tracker is not None:
+        # 3) Live OpenDota recent matches (cached by watcher when possible)
+        if watcher is not None:
             try:
-                matches = await match_tracker.get_recent_matches(target.steam_id, limit=3)
+                matches = await watcher.get_cached_recent_matches(target.steam_id)
                 if matches:
                     lines.append("")
                     lines.append("🎯 Последние матчи Dota 2 (OpenDota):")

@@ -228,6 +228,8 @@ class Watcher:
         self._last_summary_poll: float = 0.0
         self._opendota_rank_cache: Dict[str, dict] = {}  # steam_id -> rank data
         self._opendota_cache_ttl: float = 0.0
+        self._recent_matches_cache: Dict[str, list] = {}  # steam_id -> list[MatchInfo]
+        self._recent_matches_cache_ttl: float = 0.0
         self._last_cleanup_date: str = ""
 
     async def start(self) -> None:
@@ -244,6 +246,21 @@ class Watcher:
             except asyncio.CancelledError:
                 pass
         logger.info("Watcher stopped")
+
+    async def get_cached_recent_matches(self, steam_id: str) -> list:
+        """Get cached recent matches, or fetch if cache is cold."""
+        cached = self._recent_matches_cache.get(steam_id)
+        if cached:
+            return cached
+        if self._match_tracker:
+            try:
+                matches = await self._match_tracker.get_recent_matches(steam_id, limit=3)
+                if matches:
+                    self._recent_matches_cache[steam_id] = matches
+                return matches
+            except Exception:
+                pass
+        return []
 
     async def _run_loop(self) -> None:
         while self._running:
@@ -774,6 +791,13 @@ class Watcher:
             except Exception as e:
                 logger.error("Match lookup failed for %s: %s", target.name, e)
                 continue
+
+            try:
+                recent = await self._match_tracker.get_recent_matches(target.steam_id, limit=3)
+                if recent:
+                    self._recent_matches_cache[target.steam_id] = recent
+            except Exception:
+                pass
 
             if match is None:
                 continue
