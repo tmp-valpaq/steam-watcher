@@ -2,7 +2,7 @@
 
 ## Overview
 
-Steam Watcher — single-process Telegram бот для мониторинга Steam-профилей с детектом невидимок.
+Steam Watcher — single-process Telegram бот для мониторинга Steam-профилей с детектом невидимок, скрытой активности через OpenDota, и полной историей событий.
 
 ## Layers
 
@@ -12,10 +12,10 @@ Steam Watcher — single-process Telegram бот для мониторинга S
 │  (session + db + bot + watcher orchestration)│
 └──────────┬──────────────┬───────────────────┘
            │              │
-     ┌─────▼─────┐  ┌────▼─────┐
-     │  bot.py   │  │watcher.py│
-     │ (handlers)│  │ (polling)│
-     └─────┬─────┘  └────┬─────┘
+     ┌─────▼─────┐  ┌────▼──────┐
+     │  bot.py   │  │ watcher.py│
+     │ (handlers)│  │ (polling) │
+     └─────┬─────┘  └────┬──────┘
            │              │
      ┌─────▼──────────────▼─────┐
      │         db.py             │
@@ -26,133 +26,132 @@ Steam Watcher — single-process Telegram бот для мониторинга S
      │       steam.py         │
      │ (Steam API, aiohttp)   │
      └────────────────────────┘
+
+     ┌───────────────────────┐
+     │   match_tracker.py    │
+     │ (OpenDota API client) │
+     └───────────────────────┘
 ```
 
 ## Data Flow
 
 1. **Добавление таргета** — `/add ссылка` → bot.py резолвит vanity URL → берёт ник из Steam → сохраняет в db.py
-2. **Поллинг** — watcher.py каждые 30с забирает все активные таргеты из db.py, для каждого чекает Steam API
+2. **Поллинг** — watcher.py каждые 10с забирает все активные таргеты из db.py, группирует по API ключу, batch-запрос к Steam API
 3. **Алерты** — watcher.py сравнивает текущий стейт с предыдущим → генерирует алерты → шлёт через bot.send_message
-4. **Состояние** — каждый чек обновляет target_state в db.py (persona_state, current_game, playtime)
+4. **Состояние** — каждый чек обновляет target_state в db.py (persona_state, current_game, playtimes)
+5. **Activity log** — каждое событие логируется в activity_log (batch insert, один commit)
+6. **Match polling** — каждые 5 мин OpenDota опрашивается для offline-таргетов (детект скрытых Dota 2 матчей)
 
 ## Invisible Detection
 
 Ключевая фича. Steam позволяет ставить "Невидимку" — статус показывает offline, но наигранные часы продолжают тикать.
 
-Алгоритм:
-1. `persona_state == 0` (offline)
-2. `playtime_forever` для какой-либо игры увеличился с прошлого чека
-3. Оба условия → пользователь играет в невидимке
+### Два уровня детекта:
 
-Ограничение: если юзер только зашёл в игру и ещё не наиграл ни минуты — не детектится. Playtime обновляется раз в ~1 минуту.
+1. **Playtime delta** (основной): `persona_state == 0` и `playtime_forever` для какой-либо игры увеличился. Бот ведёт свои счётчики `game_playtimes` JSON вместо ненадёжного `GetRecentlyPlayedGames`.
 
-## Third-Party Match Tracking (идея, не реализовано)
+2. **OpenDota match check** (для Dota 2): бот опрашивает OpenDota API каждые 5 мин для offline-таргетов. Если найден новый матч — алерт "скрытая активность".
 
-### Проблема
-Человек может сидеть в невидимке месяцами. Steam API показывает "Last online: 30 дней назад", playtime не растёт (если не играет). Но если он играет в CS2/Dota — его последний матч виден на сторонних сайтах даже при закрытом профиле.
+## Self-Tracked Playtime
 
-### Как это работает
-Сторонние сайты (dotabuff, cstracker, leetify) показывают последний матч через матч-историю. Механика:
-- Даже если профиль Private, если в лобби был хотя бы один игрок с публичным профилем — вся катка видна
-- Данные цепляются по цепочке: один публичный игрок в матче → раскрывает всех остальных
-- Не всегда показывает последний матч — зависит от сайта и игры
+Бот больше НЕ зависит от `GetRecentlyPlayedGames` (ненадёжный, кешированный, только 2 недели). Вместо этого:
 
-### Что можно парсить
-- **CS2**: cstracker.gg, leetify — показывают последний матч с датой
-- **Dota 2**: dotabuff.com, opendota.com — показывают последний матч с точным временем
-- **Общее**: steamid.uk — показывает историю банов, смен ника (даже на приватных)
+- Хранит `game_playtimes` JSON в target_states — мапа appid → minutes
+- При каждом поллинге инкрементит текущую игру на poll interval (30 сек = ~0.5 мин)
+- Это даёт стабильные данные для детекта невидимок и daily summary
 
-### Что это даёт
-- Последний матч → дата/время → "человек играл 2 часа назад" даже если невидимка
-- Работает на Private профилях (не всегда, но часто)
-- Можно комбинировать с Steam API для более точного детекта
+## Activity Log
 
-### Риски
-- Парсинг сайтов = хрупко (верстка меняется, можно забанить)
-- Работает только для CS2/Dota, не для всех игр
-- Некоторые сайты требуют авторизацию / имеют rate limit
-- Не всегда показывает именно последний матч
+Таблица `activity_log` с типами: `game_start`, `game_stop`, `match`, `online`, `offline`, `invisible`, `name_change`.
 
-### Потенциальная реализация
-1. Добавить `MatchTracker` класс в src/
-2. Для каждого таргета хранить `last_match_time` в target_states
-3. Парсить dotabuff/cstracker раз в 5 минут
-4. Если `last_match_time` новее чем `last_seen` из Steam API → алерт "скрытая активность"
-5. Использовать headless browser или API если доступно
+- Batch insert — все события одного поллинга пишутся одним `executemany`
+- Авточистка — раз в день удаляются записи старше 30 дней
+- Кнопка "Консистентность" показывает последние 10 событий с иконками
+
+## Caching
+
+In-memory кеши в Watcher для минимизации API-вызовов:
+
+- **Game names** — `game_name_cache: Dict[appid, name]` — пополняется из profile data при каждом поллинге. Не только hardcoded 12 игр.
+- **Recent matches** — `recent_matches_cache: Dict[steam_id, list[MatchInfo]]` — кешируется при match polling, переиспользуется в кнопке "Консистентность"
+- **Dota MMR/rank** — `opendota_rank_cache` с TTL 10 мин, обогащает алерт "начал играть в Dota 2"
+
+Все кеши in-memory — теряются при рестарте, но быстро заполняются.
 
 ## Key Components
 
 ### config.py
 - `STEAM_BOT_TOKEN` из окружения
-- `DEFAULT_STEAM_API_KEY` — серверный API ключ (юзерам не нужен свои)
+- `DEFAULT_STEAM_API_KEY` — серверный API ключ
 - `DB_PATH` — путь к SQLite файлу
 - `DEFAULT_POLL_INTERVAL` — 30 сек
-- `PERSONA_STATES` — мапа Steam статусов
+- `PERSONA_STATES`, `VISIBILITY_STATES` — мапы статусов
 
 ### models.py
-Dataclasses: `User`, `Target`, `TargetState`, `Alert`, `SteamProfile`, `RecentGames`. Чистые данные, без логики.
+Dataclasses: `User`, `Target`, `TargetState`, `Alert`, `SteamProfile`, `MatchInfo`, `UserSettings`. Чистые данные, без логики.
 
 ### steam.py
-- `SteamClient` — обёртка над `aiohttp.ClientSession`, rate limit 1 req/sec
-- Методы: `get_player_summaries`, `get_recently_played`, `resolve_vanity_url`, `validate_key`
+- `SteamClient` — обёртка над `aiohttp.ClientSession`, batch API support
+- Методы: `get_player_summaries`, `get_player_summaries_batch`, `resolve_vanity_url`, `validate_key`
 - Pure functions: `state_name`, `format_last_seen`, `detect_invisible`
+- `get_recently_played` УДАЛЁН — заменён на self-tracked playtime
 
 ### db.py
 - Один `aiosqlite.Connection`, передаётся через DI
-- CRUD для users, targets, target_states
-- `rename_target` для обновления отображаемого имени
+- CRUD для users, targets, target_states, user_settings, target_settings
+- `get_target_by_id()` — прямой запрос по ID + ownership check (не N+1)
+- `save_activity_batch()` — batch insert для activity_log
+- `cleanup_activity_log()` — удаление старых записей
+- Schema migration: auto-add missing columns при init
 
 ### watcher.py
 - `generate_alerts()` — чистая функция, без I/O, полностью тестируемая
 - `Watcher` — async task, поллит таргеты и отправляет алерты
 - Alert callback инжектится для тестируемости
 - Fallback на DEFAULT_STEAM_API_KEY если у юзера нет своего ключа
+- Периодические задачи: session updates (60с), daily summaries (60с), activity cleanup (1/день)
+
+### match_tracker.py
+- `MatchTracker` — OpenDota API client с rate limiting (1 req/sec)
+- Hero name cache (lazy load)
+- Методы: `get_last_match`, `get_recent_matches`, `get_last_matches_batch`
 
 ### bot.py
-- aiogram 3.x router с хендлерами команд
-- Все ответы plain text (без parse_mode)
+- aiogram 3.x router с хендлерами команд и inline-кнопок
+- Bottom menu: ➕ Добавить, 📋 Мой список, 🔍 Проверить, ⚙️ Настройки
+- Inline кнопки на таргетах: Пауза, Консистентность, Сессия, Алерты, Удалить, Проверить
+- Settings panel: сводка, время сводки, timezone, сессии, приватность
+- Per-target alert settings: 7 типов алертов вкл/выкл
 - `_parse_steam_input()` — парсит URL / SteamID64 / vanity name
-- `_resolve_target_id()` — резолвит любой ввод в SteamID64 (URL → vanity → steam API)
-- Команды принимают URL, SteamID64 или имя таргета
+- `_resolve_target_id()` — резолвит любой ввод в SteamID64
 
 ### main.py
 - Создаёт `aiosqlite` connection и `aiohttp.ClientSession`
-- Связывает `SteamClient`, `Watcher`, `Bot`, `Dispatcher`
+- Связывает `SteamClient`, `MatchTracker`, `Watcher`, `Bot`, `Dispatcher`
+- Передаёт `watcher` в `setup_bot()` для доступа к кешу
 - Управляет lifecycle (startup/shutdown)
 
-## UX Flow
+## Timezone Support
 
-### Простой путь (без своего API ключа)
-1. `/add https://steamcommunity.com/id/gabelogannewell` — всё, ник подтянется сам
-2. Бот мониторит и шлёт алерты
-
-### Продвинутый (свой API ключ)
-1. `/setkey YOUR_KEY` — привязать свой ключ
-2. `/add ссылка` — добавить таргета
-3. `/rename ссылка новый_ник` — переименовать если нужно
-
-### Команды
-- `/add ссылка` — добавить таргета (ник из Steam)
-- `/remove ссылка` — удалить
-- `/list` — все таргеты со статусом
-- `/pause ссылка` / `/resume ссылка`
-- `/check ссылка` — мгновенная проверка
-- `/rename ссылка новый_ник` — переименовать
-- `/setkey API_KEY` — (опционально) свой ключ
+- `user_settings.timezone` — default UTC, backward compatible
+- Timezone picker в настройках (8 популярных зон)
+- Daily summary считает время в timezone пользователя через stdlib `zoneinfo`
+- Без внешних зависимостей
 
 ## Design Decisions
 
-| Решение | Почему |
-|---------|--------|
-| Plain text сообщения | Спецсимволы в Steam-никах крашат Telegram API с Markdown/HTML |
-| Один DB connection | Single-process, нет смысла в пуле |
-| Один HTTP session | aiohttp сессия переиспользуется |
-| Rate limit 1 req/s | Steam не документирует лимиты |
-| generate_alerts() — pure | Легко тестировать без моков I/O |
-| Дефолтный API ключ | Юзерам не нужно регистрироваться на Steam Dev |
-| URL вместо SteamID64 | Простота для обычных юзеров |
-| Авто-ник из Steam | Не заставлять придумывать имена |
-| 30 сек интервал | Баланс между скоростью и лимитами API |
+- **Plain text сообщения** — спецсимволы в Steam-никах крашат Telegram API с Markdown/HTML
+- **Один DB connection** — single-process, нет смысла в пуле
+- **Один HTTP session** — aiohttp сессия переиспользуется между SteamClient, MatchTracker, и Dota enrichment
+- **Rate limit 1 req/s** — Steam не документирует лимиты, OpenDota free tier = 1 req/s
+- **generate_alerts() pure** — легко тестировать без моков I/O
+- **Self-tracked playtime** — GetRecentlyPlayedGames ненадёжный (кешированный, 2 недели). Свои данные стабильнее
+- **Batch activity insert** — 1 commit на все события поллинга вместо N
+- **In-memory caches** — теряются при рестарте, но заполняются за 1-2 цикла поллинга
+- **30-day activity retention** — автоочистка, таблица не растёт бесконечно
+- **URL вместо SteamID64** — простота для обычных юзеров
+- **Авто-ник из Steam** — не заставлять придумывать имена
+- **30 сек интервал** — баланс между скоростью и лимитами API
 
 ## Scalability
 
@@ -166,4 +165,4 @@ Dataclasses: `User`, `Target`, `TargetState`, `Alert`, `SteamProfile`, `RecentGa
 
 ## Steam API Limits
 
-Valve не публикует точные лимиты. Общепринятая оценка: ~100,000 запросов/день на ключ (~1.15 req/sec). Мы ставим 1 req/sec — безопасно. С дефолтным серверным ключом и 30с интервалом: 1 юзер с 5 таргетами = ~14,400 запросов/день, хватает на ~7 юзеров. При превышении — каждому `/setkey`.
+Valve не публикует точные лимиты. Общепринятая оценка: ~100,000 запросов/день на ключ (~1.15 req/sec). Мы ставим 1 req/sec — безопасно. Batch API (`get_player_summaries_batch`) уменьшает кол-во запросов. С дефолтным серверным ключом и 30с интервалом: 1 юзер с 5 таргетами = ~14,400 запросов/день, хватает на ~7 юзеров. При превышении — каждому `/setkey`.
