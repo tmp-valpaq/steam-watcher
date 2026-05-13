@@ -37,14 +37,12 @@ APPID_NAMES = {
 }
 
 
-def _appid_to_name(appid: str, recent_games: list = None) -> str:
-    """Convert appid to game name using lookup or recent games data."""
+def _appid_to_name(appid: str, game_name_cache: dict = None) -> str:
+    """Convert appid to game name using runtime cache or hardcoded fallback."""
+    if game_name_cache and appid in game_name_cache:
+        return game_name_cache[appid]
     if appid in APPID_NAMES:
         return APPID_NAMES[appid]
-    if recent_games:
-        for g in recent_games:
-            if str(g["appid"]) == appid:
-                return g.get("name", f"App {appid}")
     return f"App {appid}"
 
 
@@ -79,6 +77,7 @@ def generate_alerts(
     current_state: TargetState,
     is_invisible: bool,
     grown_games: List[dict] = None,
+    game_name_cache: dict = None,
 ) -> List[Alert]:
     """
     Compare previous and current state, generating alerts for changes.
@@ -109,7 +108,7 @@ def generate_alerts(
     if is_invisible:
         if grown_games:
             top = grown_games[0]
-            game_name = _appid_to_name(top["appid"])
+            game_name = _appid_to_name(top["appid"], game_name_cache)
             delta_min = top["delta"]
             alert_msg = (
                 f"👻 {name}: НЕВИДИМКА! Играет в {game_name} "
@@ -119,7 +118,7 @@ def generate_alerts(
             if len(grown_games) > 1:
                 others = []
                 for g in grown_games[1:3]:  # max 2 more
-                    others.append(f"{_appid_to_name(g['appid'])} (+{g['delta']} мин)")
+                    others.append(f"{_appid_to_name(g['appid'], game_name_cache)} (+{g['delta']} мин)")
                 if others:
                     alert_msg += "\nТакже: " + ", ".join(others)
         else:
@@ -231,6 +230,8 @@ class Watcher:
         self._recent_matches_cache: Dict[str, list] = {}  # steam_id -> list[MatchInfo]
         self._recent_matches_cache_ttl: float = 0.0
         self._last_cleanup_date: str = ""
+        # appid (str) -> game name; seeded with hardcoded fallbacks, enriched from Steam profile responses
+        self._game_name_cache: Dict[str, str] = dict(APPID_NAMES)
 
     async def start(self) -> None:
         self._running = True
@@ -367,6 +368,15 @@ class Watcher:
             logger.warning("Could not fetch profile for target %s", target.name)
             return
 
+        # Cache game name whenever Steam includes one — repopulates on restart
+        if profile.game_id and profile.game_name:
+            self._game_name_cache[str(profile.game_id)] = profile.game_name
+
+        # If Steam returned an app id but no name, fall back to the cache
+        resolved_game_name = profile.game_name
+        if profile.game_id and not resolved_game_name:
+            resolved_game_name = self._game_name_cache.get(str(profile.game_id))
+
         previous_state = await db.get_target_state(self._db, target.id)
 
         # Parse previous per-game playtimes (our own tracking, not Steam's unreliable API)
@@ -390,9 +400,9 @@ class Watcher:
         # Determine game_start_time:
         # If target just started playing (new game, wasn't playing before), set start time
         game_start_time = previous_state.game_start_time if previous_state else None
-        if profile.game_name and profile.persona_state > 0:
+        if resolved_game_name and profile.persona_state > 0:
             was_playing = previous_state and previous_state.game_name and previous_state.persona_state > 0
-            if not was_playing or (previous_state and previous_state.game_name != profile.game_name):
+            if not was_playing or (previous_state and previous_state.game_name != resolved_game_name):
                 # New game session started
                 game_start_time = now
             # else: continuing same game, keep existing game_start_time
@@ -425,7 +435,7 @@ class Watcher:
             persona_state=profile.persona_state,
             persona_name=profile.persona_name,
             game_id=profile.game_id,
-            game_name=profile.game_name,
+            game_name=resolved_game_name,
             playtime_forever=total_playtime,
             last_logoff=profile.last_logoff,
             last_checked=now,
@@ -446,7 +456,9 @@ class Watcher:
         # Detect which games grew (for invisible alerts)
         grown_games = self._detect_grown_games(current_game_pts, prev_game_pts)
 
-        alerts = generate_alerts(target, previous_state, current_state, is_invisible, grown_games)
+        alerts = generate_alerts(
+            target, previous_state, current_state, is_invisible, grown_games, self._game_name_cache,
+        )
         # Load per-target settings once for the loop
         target_settings = await db.get_target_settings(self._db, target.id)
         for alert in alerts:
@@ -655,7 +667,7 @@ class Watcher:
                         prev = snapshot_pts.get(appid, 0)
                         delta = playtime - prev
                         if delta > 0:
-                            game_name = _appid_to_name(appid)
+                            game_name = _appid_to_name(appid, self._game_name_cache)
                             aggregated[game_name] = aggregated.get(game_name, 0) + delta
 
                 if not aggregated:
