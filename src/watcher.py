@@ -223,6 +223,7 @@ class Watcher:
         self._last_summary_poll: float = 0.0
         self._opendota_rank_cache: Dict[str, dict] = {}  # steam_id -> rank data
         self._opendota_cache_ttl: float = 0.0
+        self._last_cleanup_date: str = ""
 
     async def start(self) -> None:
         self._running = True
@@ -270,6 +271,17 @@ class Watcher:
                     await self._send_daily_summaries()
                 except Exception as e:
                     logger.error("Error in daily summaries: %s", e)
+
+            # Activity log cleanup (once per day)
+            today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+            if today != self._last_cleanup_date:
+                self._last_cleanup_date = today
+                try:
+                    deleted = await db.cleanup_activity_log(self._db, retention_days=30)
+                    if deleted > 0:
+                        logger.info("Cleaned up %d old activity_log entries", deleted)
+                except Exception as e:
+                    logger.error("Activity log cleanup failed: %s", e)
 
             await asyncio.sleep(10)
 
@@ -462,6 +474,7 @@ class Watcher:
     ) -> None:
         """Persist key state-change events to activity_log based on generated alerts."""
         now = int(time.time())
+        entries = []
         for alert in alerts:
             msg = alert.message
             event_type = None
@@ -477,10 +490,8 @@ class Watcher:
                 game_name = curr.game_name
             elif "перестал играть" in msg:
                 event_type = "game_stop"
-                # Extract game name from the alert message
                 if prev and prev.game_name:
                     game_name = prev.game_name
-                # Compute session duration
                 if prev and prev.game_start_time:
                     elapsed = now - prev.game_start_time
                     if elapsed > 0:
@@ -491,17 +502,23 @@ class Watcher:
                     details = f"{prev.persona_name} → {curr.persona_name}"
             elif "НЕВИДИМКА" in msg:
                 event_type = "invisible"
-                if game_name is None and curr.game_name:
+                if curr.game_name:
                     game_name = curr.game_name
 
             if event_type:
-                try:
-                    await db.save_activity(
-                        self._db, target.id, event_type,
-                        game_name=game_name, details=details, detected_at=now,
-                    )
-                except Exception as e:
-                    logger.error("Failed to log activity: %s", e)
+                entries.append({
+                    "target_id": target.id,
+                    "event_type": event_type,
+                    "game_name": game_name,
+                    "details": details,
+                    "detected_at": now,
+                })
+
+        if entries:
+            try:
+                await db.save_activity_batch(self._db, entries)
+            except Exception as e:
+                logger.error("Failed to log activities: %s", e)
 
     @staticmethod
     def _detect_grown_games(

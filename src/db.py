@@ -389,6 +389,50 @@ async def save_activity(
     await db.commit()
 
 
+async def save_activity_batch(
+    db: aiosqlite.Connection,
+    entries: list,
+) -> None:
+    """Log multiple activity events in a single transaction.
+    entries: list of dicts with keys target_id, event_type, and optional
+              game_name, match_id, hero_name, duration_seconds, details, detected_at.
+    """
+    if not entries:
+        return
+    import time
+    now = int(time.time())
+    rows = []
+    for e in entries:
+        detected_at = e.get("detected_at") or now
+        rows.append((
+            e["target_id"], e["event_type"],
+            e.get("game_name"), e.get("match_id"),
+            e.get("hero_name"), e.get("duration_seconds"),
+            e.get("details"), detected_at,
+        ))
+    await db.executemany(
+        "INSERT INTO activity_log "
+        "(target_id, event_type, game_name, match_id, hero_name, duration_seconds, details, detected_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    await db.commit()
+
+
+async def cleanup_activity_log(
+    db: aiosqlite.Connection,
+    retention_days: int = 30,
+) -> int:
+    """Delete activity_log entries older than retention_days. Returns count deleted."""
+    import time
+    cutoff = int(time.time()) - (retention_days * 86400)
+    cursor = await db.execute(
+        "DELETE FROM activity_log WHERE detected_at < ?", (cutoff,)
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def get_activity_log(
     db: aiosqlite.Connection,
     target_id: int,
