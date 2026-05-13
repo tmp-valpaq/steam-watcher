@@ -960,11 +960,7 @@ async def _get_target_by_id(
     target_id: int,
 ) -> Optional[Target]:
     """Get a target by ID, verifying it belongs to the given telegram user."""
-    targets = await db.get_targets(db_conn, telegram_id)
-    for t in targets:
-        if t.id == target_id:
-            return t
-    return None
+    return await db.get_target_by_id(db_conn, target_id, telegram_id)
 
 
 async def _resolve_target_id(

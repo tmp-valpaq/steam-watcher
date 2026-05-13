@@ -108,6 +108,22 @@ async def get_targets(db: aiosqlite.Connection, telegram_id: int) -> List[Target
         ]
 
 
+async def get_target_by_id(db: aiosqlite.Connection, target_id: int, telegram_id: int) -> Optional[Target]:
+    """Get a single target by ID, verifying ownership via telegram_id."""
+    async with db.execute(
+        "SELECT id, telegram_id, steam_id, name, interval_seconds, active "
+        "FROM targets WHERE id = ? AND telegram_id = ?",
+        (target_id, telegram_id),
+    ) as cur:
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return Target(
+            id=row[0], telegram_id=row[1], steam_id=row[2],
+            name=row[3], interval_seconds=row[4], active=bool(row[5]),
+        )
+
+
 async def get_active_targets(db: aiosqlite.Connection) -> List[Target]:
     async with db.execute(
         "SELECT id, telegram_id, steam_id, name, interval_seconds, active "
