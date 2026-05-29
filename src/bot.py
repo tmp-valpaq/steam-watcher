@@ -15,6 +15,7 @@ from . import db
 from .config import DEFAULT_STEAM_API_KEY, DEFAULT_POLL_INTERVAL
 from .models import Target, TargetState, UserSettings
 from .steam import SteamClient, state_name, format_last_seen
+from .cs2_activity import CS2ActivityResolver, format_cs2_activity_lines
 
 logger = logging.getLogger(__name__)
 
@@ -254,7 +255,24 @@ def _build_target_settings_keyboard(target_id: int, settings: dict) -> types.Inl
     return builder.as_markup()
 
 
-def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: SteamClient, match_tracker=None, watcher=None) -> Dispatcher:
+def setup_bot(
+    bot_instance: Bot,
+    db_conn: aiosqlite.Connection,
+    steam_client: SteamClient,
+    match_tracker=None,
+    watcher=None,
+    cs2_resolver: Optional[CS2ActivityResolver] = None,
+) -> Dispatcher:
+
+    async def _append_cs2_activity(lines: list[str], steam_id: str) -> None:
+        if cs2_resolver is None:
+            return
+        try:
+            result = await cs2_resolver.lookup(steam_id)
+        except Exception as exc:
+            logger.warning("CS2 activity lookup failed for %s: %s", steam_id, exc)
+            return
+        lines.extend(format_cs2_activity_lines(result))
 
     @router.message(CommandStart())
     async def cmd_start(message: Message) -> None:
@@ -470,6 +488,7 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
             lines.append(f"Играет: {profile.game_name}")
         if profile.last_logoff:
             lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
+        await _append_cs2_activity(lines, steam_id)
 
         await message.answer("\n".join(lines))
 
@@ -652,6 +671,7 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
             lines.append(f"Играет: {profile.game_name}")
         if profile.last_logoff:
             lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
+        await _append_cs2_activity(lines, target.steam_id)
 
         await callback.message.answer("\n".join(lines))
 
@@ -686,6 +706,7 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
             lines.append(f"Играет: {profile.game_name}")
         if profile.last_logoff:
             lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
+        await _append_cs2_activity(lines, target.steam_id)
 
         await callback.message.edit_text("\n".join(lines))
 
@@ -762,6 +783,8 @@ def setup_bot(bot_instance: Bot, db_conn: aiosqlite.Connection, steam_client: St
                         lines.append(f"  {ts} — {hero} ({dur})")
             except Exception:
                 pass
+
+        await _append_cs2_activity(lines, target.steam_id)
 
         await callback.message.answer("\n".join(lines))
 

@@ -12,6 +12,7 @@ from .match_tracker import MatchTracker
 from .steam import SteamClient
 from .watcher import Watcher
 from .bot import setup_bot
+from .cs2_activity import CS2ActivityResolver
 from aiogram import Bot
 
 logging.basicConfig(
@@ -38,6 +39,7 @@ async def main() -> None:
         async with aiohttp.ClientSession() as session:
             steam_client = SteamClient(session)
             match_tracker = MatchTracker(session)
+            cs2_resolver = CS2ActivityResolver(session)
 
             # Create bot
             bot = Bot(token=STEAM_BOT_TOKEN)
@@ -51,7 +53,14 @@ async def main() -> None:
             await watcher.start()
 
             # Setup and start bot dispatcher
-            dispatcher = setup_bot(bot, db_conn, steam_client, match_tracker, watcher)
+            dispatcher = setup_bot(
+                bot,
+                db_conn,
+                steam_client,
+                match_tracker,
+                watcher,
+                cs2_resolver,
+            )
 
             try:
                 logger.info("Starting Steam Watcher bot...")
