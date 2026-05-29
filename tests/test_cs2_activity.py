@@ -220,6 +220,61 @@ def test_format_lines_for_found_activity():
     assert any("Карта: de_mirage" == line for line in lines)
 
 
+def test_format_last_signal_line_marks_coarse_evidence_as_approximate():
+    from src.cs2_activity import _format_last_signal_line
+
+    # Minute precision -> exact timestamp, no approximate hedging.
+    minute = build_activity_window([MatchActivity("2026-05-28T21:30:00Z", "x", "minute")])
+    assert _format_last_signal_line(minute) == "Последний сигнал: 2026-05-28T21:30:00Z"
+
+    # Day-level cluster -> date only, explicitly labelled as day precision.
+    day = build_activity_window(
+        [
+            MatchActivity("2026-05-28T01:00:00Z", "2026-05-28", "day"),
+            MatchActivity("2026-05-28T00:00:00Z", "2026-05-28", "day"),
+        ]
+    )
+    assert day is not None and day.precision == "day"
+    assert _format_last_signal_line(day) == "Последний сигнал: ~2026-05-28 (с точностью до дня)"
+
+    # Relative-only hint -> raw phrase, flagged as a relative estimate.
+    relative = build_activity_window(
+        [],
+        relative_hints=[MatchActivity(None, "yesterday", "relative")],
+    )
+    assert relative is not None and relative.precision == "relative"
+    assert _format_last_signal_line(relative) == "Последний сигнал: примерно «yesterday» (относительная оценка)"
+
+
+def test_format_lines_does_not_show_minute_exact_for_day_cluster():
+    window = build_activity_window(
+        [
+            MatchActivity("2026-05-28T01:00:00Z", "2026-05-28", "day"),
+            MatchActivity("2026-05-28T00:00:00Z", "2026-05-28", "day"),
+        ]
+    )
+    from src.cs2_activity import ProviderResult
+
+    provider_result = ProviderResult(
+        provider="leetify",
+        status="found_recent_activity",
+        profile_found=True,
+        profile_url="https://leetify.com/public/profile/1",
+        last_activity_window=window,
+        recent_matches=[],
+        recent_sessions=[],
+        confidence="low",
+        signal_strength="weak",
+        notes=[],
+    )
+    resolver = CS2ActivityResolver(MagicMock())
+    result = resolver._to_response(provider_result, [])
+    lines = format_cs2_activity_lines(result)
+    # The coarse end instant must not surface as a minute-exact timestamp.
+    assert not any("T01:00:00Z" in line for line in lines)
+    assert any("с точностью до дня" in line for line in lines)
+
+
 def test_is_likely_cloudflare_block():
     assert is_likely_cloudflare_block(403, "")
     assert is_likely_cloudflare_block(429, "")

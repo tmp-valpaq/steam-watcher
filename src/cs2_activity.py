@@ -754,6 +754,26 @@ class CS2ActivityResolver:
         )
 
 
+def _format_last_signal_line(window: ActivityWindow) -> Optional[str]:
+    """Render the "last signal" line without overstating precision.
+
+    A minute/hour timestamp is shown as-is. Coarser evidence (day-level
+    clusters, unknown precision, or a bare relative phrase) is explicitly
+    labelled approximate so the Russian output never reads minute-exact when
+    the underlying signal is not.
+    """
+    ended = window.ended_at_approx
+    if ended:
+        if window.precision in ("minute", "hour"):
+            return f"Последний сигнал: {ended}"
+        if window.precision == "day":
+            return f"Последний сигнал: ~{ended.split('T', 1)[0]} (с точностью до дня)"
+        return f"Последний сигнал: ~{ended} (приблизительно)"
+    if window.precision == "relative" and window.ended_at_raw:
+        return f"Последний сигнал: примерно «{window.ended_at_raw}» (относительная оценка)"
+    return None
+
+
 def format_cs2_activity_lines(result: CS2ActivityResult) -> list[str]:
     if result.status == "unknown":
         return []
@@ -778,8 +798,10 @@ def format_cs2_activity_lines(result: CS2ActivityResult) -> list[str]:
     window = result.activity_window
     if window and window.started_at_approx and window.ended_at_approx:
         lines.append(f"Окно: {window.started_at_approx} → {window.ended_at_approx}")
-    elif window and window.ended_at_approx:
-        lines.append(f"Последний сигнал: {window.ended_at_approx}")
+    elif window:
+        signal_line = _format_last_signal_line(window)
+        if signal_line:
+            lines.append(signal_line)
     if result.recent_matches:
         newest = result.recent_matches[0]
         if newest.map_name:
