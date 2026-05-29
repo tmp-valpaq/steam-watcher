@@ -176,7 +176,7 @@ class TestBatchGetPlayerSummaries:
     async def test_batch_api_error_returns_empty(self):
         """Batch request that throws returns empty dict."""
         mock_response = AsyncMock()
-        mock_response.raise_for_status.side_effect = Exception("API error")
+        mock_response.raise_for_status = MagicMock(side_effect=Exception("API error"))
 
         ctx_mgr = MagicMock()
         ctx_mgr.__aenter__ = AsyncMock(return_value=mock_response)

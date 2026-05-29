@@ -98,7 +98,7 @@ class TestGetLastMatch:
     @pytest.mark.asyncio
     async def test_api_error_returns_none(self):
         mock_response = AsyncMock()
-        mock_response.raise_for_status.side_effect = Exception("API error")
+        mock_response.raise_for_status = MagicMock(side_effect=Exception("API error"))
 
         ctx_mgr = MagicMock()
         ctx_mgr.__aenter__ = AsyncMock(return_value=mock_response)
