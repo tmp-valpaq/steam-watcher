@@ -564,10 +564,17 @@ class CS2ActivityResolver:
 
     async def _lookup(self, steam_id: str) -> CS2ActivityResult:
         diagnostics: list[dict[str, str]] = []
-        results = [
-            await self._lookup_leetify(steam_id),
-            await self._lookup_csstats(steam_id),
-        ]
+        # Run providers concurrently to cut avoidable latency. gather preserves
+        # the input order, so diagnostics order and the order-sensitive tie-break
+        # in _pick_best stay identical to the old sequential path. Each provider
+        # method already traps its own errors and returns a ProviderResult, and
+        # the whole-lookup timeout in lookup() still wraps this gather.
+        results = list(
+            await asyncio.gather(
+                self._lookup_leetify(steam_id),
+                self._lookup_csstats(steam_id),
+            )
+        )
         for result in results:
             diagnostics.append(
                 {

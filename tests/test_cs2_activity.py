@@ -196,6 +196,46 @@ async def test_resolver_prefers_precise_csstats_over_coarse_leetify():
     assert result.activity_window.precision == "minute"
 
 
+@pytest.mark.asyncio
+async def test_lookup_runs_providers_concurrently():
+    # Deterministic proof of concurrency: leetify cannot finish until csstats has
+    # started. Under the old sequential path leetify would block forever, so the
+    # outer wait_for would trip; concurrent execution lets both complete.
+    from src.cs2_activity import ProviderResult
+
+    resolver = CS2ActivityResolver(MagicMock())
+    csstats_started = asyncio.Event()
+
+    def _blank_result(provider: str) -> ProviderResult:
+        return ProviderResult(
+            provider=provider,
+            status="profile_not_found",
+            profile_found=False,
+            profile_url=None,
+            last_activity_window=None,
+            recent_matches=[],
+            recent_sessions=[],
+            confidence="none",
+            signal_strength="none",
+            notes=[f"{provider} stub"],
+        )
+
+    async def fake_leetify(_: str):
+        await asyncio.wait_for(csstats_started.wait(), timeout=1.0)
+        return _blank_result("leetify")
+
+    async def fake_csstats(_: str):
+        csstats_started.set()
+        return _blank_result("csstats")
+
+    resolver._lookup_leetify = fake_leetify  # type: ignore[method-assign]
+    resolver._lookup_csstats = fake_csstats  # type: ignore[method-assign]
+
+    result = await resolver.lookup("76561198000000000")
+    # Diagnostics order is preserved (leetify first), confirming gather ordering.
+    assert [diag["provider"] for diag in result.provider_diagnostics] == ["leetify", "csstats"]
+
+
 def test_format_lines_for_found_activity():
     from src.cs2_activity import ExtractedActivity, ProviderResult
 
