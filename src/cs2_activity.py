@@ -3,12 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import shlex
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Literal, Optional
-from urllib.parse import quote
 
 import aiohttp
 
@@ -35,6 +33,11 @@ RECENCY_STALE_MAX_DAYS = 90
 
 LEETIFY_API_URL = "https://api.cs-prod.leetify.com/api/profile/id/{steam_id}"
 CSSTATS_URL = "https://csstats.gg/player/{steam_id}/stats"
+
+# Hard timeouts so a slow/hung provider can never block a bot handler.
+# Per-provider HTTP call ceiling and an overall whole-lookup ceiling.
+PROVIDER_HTTP_TIMEOUT_SECONDS = 6.0
+LOOKUP_TIMEOUT_SECONDS = 10.0
 
 ISO_TIMESTAMP_REGEX = re.compile(
     r"\b(20\d{2}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))\b"
@@ -342,34 +345,59 @@ def is_likely_cloudflare_block(status: int, body: str) -> bool:
     )
 
 
-def extract_relative_time_hints(body: str) -> list[MatchActivity]:
+def _match_anchor_positions(body: str) -> list[int]:
+    return [found.start() for found in CSSTATS_MATCH_URL_REGEX.finditer(body)]
+
+
+def _near_any_anchor(index: int, anchors: list[int], window: int) -> bool:
+    return any(abs(index - anchor) <= window for anchor in anchors)
+
+
+def extract_relative_time_hints(
+    body: str,
+    anchors: Optional[list[int]] = None,
+    window: int = CSSTATS_ROW_CONTEXT,
+) -> list[MatchActivity]:
     unique: set[str] = set()
     hints: list[MatchActivity] = []
-    for found in RELATIVE_TIME_REGEX.findall(body):
-        key = found.lower().strip()
+    for found in RELATIVE_TIME_REGEX.finditer(body):
+        if anchors is not None and not _near_any_anchor(found.start(), anchors, window):
+            continue
+        value = found.group(1)
+        key = value.lower().strip()
         if key in unique:
             continue
         unique.add(key)
-        hints.append(MatchActivity(None, found.strip(), "relative"))
+        hints.append(MatchActivity(None, value.strip(), "relative"))
     return hints
 
 
-def extract_machine_readable_matches(body: str) -> list[MatchActivity]:
+def extract_machine_readable_matches(
+    body: str,
+    anchors: Optional[list[int]] = None,
+    window: int = CSSTATS_ROW_CONTEXT,
+) -> list[MatchActivity]:
     seen: set[str] = set()
     matches: list[MatchActivity] = []
-    for found in ISO_TIMESTAMP_REGEX.findall(body):
-        if found in seen:
+    for found in ISO_TIMESTAMP_REGEX.finditer(body):
+        if anchors is not None and not _near_any_anchor(found.start(), anchors, window):
             continue
-        seen.add(found)
-        precision: MatchTimePrecision = "minute" if len(found) >= 16 else "unknown"
-        matches.append(MatchActivity(_normalize_iso(found), found, precision))
+        value = found.group(1)
+        if value in seen:
+            continue
+        seen.add(value)
+        precision: MatchTimePrecision = "minute" if len(value) >= 16 else "unknown"
+        matches.append(MatchActivity(_normalize_iso(value), value, precision))
     if matches:
         return matches
-    for found in DATE_ONLY_REGEX.findall(body):
-        if found in seen:
+    for found in DATE_ONLY_REGEX.finditer(body):
+        if anchors is not None and not _near_any_anchor(found.start(), anchors, window):
             continue
-        seen.add(found)
-        matches.append(MatchActivity(f"{found}T00:00:00Z", found, "day"))
+        value = found.group(1)
+        if value in seen:
+            continue
+        seen.add(value)
+        matches.append(MatchActivity(f"{value}T00:00:00Z", value, "day"))
     return matches
 
 
@@ -439,12 +467,16 @@ def extract_csstats_activity(body: str, max_matches: int = 10) -> ExtractedActiv
 
 
 def extract_activity_from_html(body: str, max_matches: int = 10) -> ExtractedActivity:
+    # Only trust timestamps/relative phrases that sit next to a /match/ link.
+    # Bare page timestamps (footers, build dates, schema.org metadata, unrelated
+    # UI copy) must not be promoted into a fabricated activity window.
+    anchors = _match_anchor_positions(body)
     exact_matches = sorted(
-        extract_machine_readable_matches(body),
+        extract_machine_readable_matches(body, anchors=anchors),
         key=lambda item: item.played_at or "",
         reverse=True,
     )
-    relative_hints = [] if exact_matches else extract_relative_time_hints(body)
+    relative_hints = [] if exact_matches else extract_relative_time_hints(body, anchors=anchors)
     recent_matches = (exact_matches + relative_hints)[:max_matches]
     window = build_activity_window(exact_matches, relative_hints)
     return ExtractedActivity(
@@ -514,6 +546,23 @@ class CS2ActivityResolver:
         self._session = session
 
     async def lookup(self, steam_id: str) -> CS2ActivityResult:
+        try:
+            return await asyncio.wait_for(
+                self._lookup(steam_id), timeout=LOOKUP_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            return self._to_response(
+                None,
+                [
+                    {
+                        "provider": "all",
+                        "status": "unknown",
+                        "note": f"CS2 lookup exceeded {LOOKUP_TIMEOUT_SECONDS:g}s and was aborted.",
+                    }
+                ],
+            )
+
+    async def _lookup(self, steam_id: str) -> CS2ActivityResult:
         diagnostics: list[dict[str, str]] = []
         results = [
             await self._lookup_leetify(steam_id),
@@ -534,9 +583,7 @@ class CS2ActivityResolver:
         profile_url = f"https://leetify.com/public/profile/{steam_id}"
         url = LEETIFY_API_URL.format(steam_id=steam_id)
         try:
-            async with self._session.get(url) as resp:
-                status = resp.status
-                body = await resp.text()
+            status, body = await self._http_get(url)
         except Exception as exc:
             return self._blank("leetify", "unknown", profile_url, False, [f"Leetify fetch failed: {exc}"])
         if status >= 400 or is_likely_cloudflare_block(status, body):
@@ -582,7 +629,7 @@ class CS2ActivityResolver:
             "accept": "*/*",
         }
         try:
-            status, body = await self._curl_get(url, headers)
+            status, body = await self._http_get(url, headers)
         except Exception as exc:
             return self._blank("csstats", "unknown", profile_url, False, [f"CSStats fetch failed: {exc}"])
         if status == 404:
@@ -619,25 +666,12 @@ class CS2ActivityResolver:
             notes=["CSStats profile reachable but no machine-readable match rows found."],
         )
 
-    async def _curl_get(self, url: str, headers: Optional[dict[str, str]] = None) -> tuple[int, str]:
-        headers = headers or {}
-        cmd = ["curl", "-sS", "-L", url, "-w", "\n__HERMES_STATUS__:%{http_code}"]
-        for key, value in headers.items():
-            cmd.extend(["-H", f"{key}: {value}"])
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            raise RuntimeError(stderr.decode().strip() or f"curl exited {proc.returncode}")
-        text = stdout.decode()
-        marker = "\n__HERMES_STATUS__:"
-        if marker not in text:
-            raise RuntimeError("curl status marker missing")
-        body, _, status_text = text.rpartition(marker)
-        return int(status_text.strip()), body
+    async def _http_get(self, url: str, headers: Optional[dict[str, str]] = None) -> tuple[int, str]:
+        # Single transport (the shared aiohttp session) with an explicit hard
+        # timeout so a stalled connection or slow read cannot hang the caller.
+        timeout = aiohttp.ClientTimeout(total=PROVIDER_HTTP_TIMEOUT_SECONDS)
+        async with self._session.get(url, headers=headers, timeout=timeout) as resp:
+            return resp.status, await resp.text()
 
     def _pick_best(self, results: list[ProviderResult]) -> Optional[ProviderResult]:
         best: Optional[ProviderResult] = None
