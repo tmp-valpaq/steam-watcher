@@ -63,36 +63,23 @@ def _build_main_menu() -> ReplyKeyboardMarkup:
 
 def _help_text() -> str:
     return (
-        "Steam Watcher Bot\n"
-        "Мониторит Steam-профили и присылает уведомления.\n"
+        "Steam Watcher — мониторинг Steam-профилей\n"
         "\n"
-        "Что отслеживает:\n"
-        "- Любые игры (все что в Steam)\n"
-        "- Зашёл онлайн / вышел оффлайн\n"
-        "- Начал / перестал играть\n"
-        "- Сменил ник\n"
-        "- Невидимки (статус offline, но наиграно растёт)\n"
-        "- Изменение видимости профиля\n"
+        "Отслеживает: онлайн/оффлайн, игры, невидимки, смену ника, приватность.\n"
+        "Проверка каждые 30 сек.\n"
         "\n"
-        "Как часто: каждые 30 сек\n"
+        "Начать: нажми ➕ Добавить и пришли ссылку на профиль Steam.\n"
         "\n"
-        "Команды:\n"
-        "/add ссылка — добавить таргет (ник подтянется сам)\n"
-        "/remove ссылка — удалить таргет\n"
-        "/list — список таргетов (с кнопками)\n"
-        "/pause ссылка — пауза\n"
-        "/resume ссылка — возобновить\n"
-        "/check ссылка — мгновенная проверка\n"
-        "/rename ссылка новый_ник — переименовать таргет\n"
+        "/add ссылка — добавить профиль\n"
+        "/list — мой список\n"
+        "/check ссылка — проверить сейчас\n"
+        "/remove ссылка — удалить\n"
+        "/pause /resume ссылка — пауза / возобновить\n"
+        "/rename ссылка новый_ник — переименовать\n"
+        "/setkey КЛЮЧ — свой Steam API ключ\n"
         "\n"
         "Вместо ссылки можно писать SteamID64 (17 цифр).\n"
-        "Пример: /add https://steamcommunity.com/id/gabelogannewell\n"
-        "\n"
-        "API ключ (опционально, если бот не работает):\n"
-        "/setkey API_KEY\n"
-        "https://steamcommunity.com/dev/apikey\n"
-        "\n"
-        "Профиль таргета должен быть Public."
+        "Профиль должен быть Public."
     )
 
 
@@ -123,6 +110,12 @@ def _parse_steam_input(text: str) -> tuple:
         return None, text
 
     return None, None
+
+
+def _is_cancel_text(text: str) -> bool:
+    """Return True when the user clearly cancels the pending add flow."""
+    normalized = text.strip().lower()
+    return normalized in {"отмена", "cancel", "/cancel"}
 
 
 def _format_playtime(minutes: int) -> str:
@@ -158,13 +151,22 @@ def _build_target_keyboard(target: Target) -> types.InlineKeyboardMarkup:
         builder.button(text="⏸ Пауза", callback_data=f"pause:{target.id}")
     else:
         builder.button(text="▶️ Возобновить", callback_data=f"resume:{target.id}")
-    builder.button(text="📊 Консистентность", callback_data=f"consistency:{target.id}")
+    builder.button(text="📜 История", callback_data=f"consistency:{target.id}")
     builder.button(text="⏱ Сессия", callback_data=f"session:{target.id}")
-    # Row 2: alerts settings + delete + check (3 buttons)
-    builder.button(text="⚙️ Алерты", callback_data=f"tset:{target.id}")
+    # Row 2: notification settings + delete + check (3 buttons)
+    builder.button(text="⚙️ Уведомления", callback_data=f"tset:{target.id}")
     builder.button(text="🗑 Удалить", callback_data=f"remove:{target.id}")
     builder.button(text="🔍 Проверить", callback_data=f"check:{target.id}")
     builder.adjust(3, 3)
+    return builder.as_markup()
+
+
+def _build_remove_confirm_keyboard(target_id: int) -> types.InlineKeyboardMarkup:
+    """Build confirmation keyboard for destructive profile removal."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="✅ Да, удалить", callback_data=f"remove_confirm:{target_id}")
+    builder.button(text="❌ Отмена", callback_data=f"remove_cancel:{target_id}")
+    builder.adjust(2)
     return builder.as_markup()
 
 
@@ -174,9 +176,10 @@ def _build_settings_keyboard(settings: UserSettings) -> types.InlineKeyboardMark
     summary_label = "✅ ВКЛ" if settings.daily_summary_enabled else "❌ ВЫКЛ"
     session_label = "✅ ВКЛ" if settings.session_updates_enabled else "❌ ВЫКЛ"
     privacy_label = "✅ ВКЛ" if settings.privacy_alerts_enabled else "❌ ВЫКЛ"
-    summary_val = "1" if settings.daily_summary_enabled else "0"
-    session_val = "1" if settings.session_updates_enabled else "0"
-    privacy_val = "1" if settings.privacy_alerts_enabled else "0"
+    # Encode desired NEW state (inverted) so handler can set it directly
+    summary_val = "0" if settings.daily_summary_enabled else "1"
+    session_val = "0" if settings.session_updates_enabled else "1"
+    privacy_val = "0" if settings.privacy_alerts_enabled else "1"
 
     builder.button(text=f"📊 Сводка: {summary_label}", callback_data=f"set_summary:{summary_val}")
     builder.button(text=f"🕐 Время сводки: {settings.daily_summary_time}", callback_data="set_time:show")
@@ -401,7 +404,7 @@ def setup_bot(
     async def cmd_list(message: Message) -> None:
         targets = await db.get_targets(db_conn, message.from_user.id)
         if not targets:
-            await message.answer("Пока никого не отслеживаешь.\nДобавь: /add ссылка_на_профиль")
+            await message.answer("Список пуст. Нажми ➕ Добавить или отправь /add ссылка_на_профиль")
             return
 
         for t in targets:
@@ -517,7 +520,7 @@ def setup_bot(
         """Handle '➕ Добавить' menu button — set pending state and ask for link."""
         _pending_add[message.from_user.id] = True
         await message.answer(
-            "Пришли ссылку на Steam профиль:",
+            "Пришли ссылку на Steam профиль (или напиши «Отмена»):",
             reply_markup=ForceReply(selective=True),
         )
 
@@ -526,7 +529,7 @@ def setup_bot(
         """Handle '📋 Мой список' menu button — same as /list."""
         targets = await db.get_targets(db_conn, message.from_user.id)
         if not targets:
-            await message.answer("Пока никого не отслеживаешь.\nДобавь: /add ссылка_на_профиль")
+            await message.answer("Список пуст. Нажми ➕ Добавить или отправь /add ссылка_на_профиль")
             return
 
         for t in targets:
@@ -550,14 +553,14 @@ def setup_bot(
         """Handle '🔍 Проверить' menu button — show targets to pick for instant check."""
         targets = await db.get_targets(db_conn, message.from_user.id)
         if not targets:
-            await message.answer("Пока никого не отслеживаешь.")
+            await message.answer("Список пуст. Добавь профили через ➕ Добавить.")
             return
 
         builder = InlineKeyboardBuilder()
         for t in targets:
             builder.button(text=t.name, callback_data=f"pick_check:{t.id}")
         builder.adjust(1)
-        await message.answer("Выбери таргет для проверки:", reply_markup=builder.as_markup())
+        await message.answer("Выбери профиль для проверки:", reply_markup=builder.as_markup())
 
     @router.message(F.text == "⚙️ Настройки")
     async def btn_settings(message: Message) -> None:
@@ -578,6 +581,9 @@ def setup_bot(
         # Steam add flow
         if _pending_add.get(user_id):
             _pending_add.pop(user_id, None)
+            if _is_cancel_text(input_text):
+                await message.answer("Добавление отменено. Когда будешь готов, нажми ➕ Добавить.")
+                return
             await _do_add_target(message, input_text)
             return
 
@@ -637,9 +643,46 @@ def setup_bot(
             await callback.answer("Не найден.", show_alert=True)
             return
 
+        await callback.answer()
+        await callback.message.edit_text(
+            f"Удалить профиль {target.name}?",
+            reply_markup=_build_remove_confirm_keyboard(target_id),
+        )
+
+    @router.callback_query(F.data.startswith("remove_confirm:"))
+    async def cb_remove_confirm(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
         await db.remove_target(db_conn, callback.from_user.id, target.steam_id)
         await callback.answer("Удалён.")
         await callback.message.edit_text(f"{target.name} — удалён.")
+
+    @router.callback_query(F.data.startswith("remove_cancel:"))
+    async def cb_remove_cancel(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
+        await callback.answer("Отменено.")
+        state = await db.get_target_state(db_conn, target.id)
+        status = "Пауза"
+        if target.active:
+            if state:
+                status = state_name(state.persona_state)
+                if state.game_name:
+                    status += f", играет: {state.game_name}"
+            else:
+                status = "Ещё не проверен"
+        marker = "активен" if target.active else "пауза"
+        text = f"{target.name} [{marker}]: {status}"
+        keyboard = _build_target_keyboard(target)
+        await callback.message.edit_text(text, reply_markup=keyboard)
 
     @router.callback_query(F.data.startswith("check:"))
     async def cb_check(callback: CallbackQuery) -> None:
