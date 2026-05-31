@@ -6,6 +6,9 @@ import sys
 import aiohttp
 import aiosqlite
 
+from aiogram import Bot
+from aiogram.types import BotCommand
+
 from .config import DB_PATH, STEAM_BOT_TOKEN
 from .db import init_db
 from .match_tracker import MatchTracker
@@ -13,7 +16,6 @@ from .steam import SteamClient
 from .watcher import Watcher
 from .bot import setup_bot
 from .cs2_activity import CS2ActivityResolver
-from aiogram import Bot
 
 logging.basicConfig(
     level=logging.INFO,
@@ -43,6 +45,17 @@ async def main() -> None:
 
             # Create bot
             bot = Bot(token=STEAM_BOT_TOKEN)
+            await bot.set_my_commands([
+                BotCommand(command="start", description="Открыть меню и помощь"),
+                BotCommand(command="add", description="Добавить Steam-профиль"),
+                BotCommand(command="list", description="Показать список профилей"),
+                BotCommand(command="check", description="Проверить профиль сейчас"),
+                BotCommand(command="remove", description="Удалить профиль"),
+                BotCommand(command="pause", description="Поставить профиль на паузу"),
+                BotCommand(command="resume", description="Снять профиль с паузы"),
+                BotCommand(command="rename", description="Переименовать профиль"),
+                BotCommand(command="setkey", description="Сохранить свой Steam API ключ"),
+            ])
 
             # Alert sender
             async def send_alert(telegram_id: int, message: str) -> None:

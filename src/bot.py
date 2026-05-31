@@ -65,18 +65,18 @@ def _help_text() -> str:
     return (
         "Steam Watcher — мониторинг Steam-профилей\n"
         "\n"
-        "Отслеживает: онлайн/оффлайн, игры, невидимки, смену ника, приватность.\n"
-        "Проверка каждые 30 сек.\n"
+        "Что отслеживает: онлайн, игры, невидимку, смену ника и приватность.\n"
+        "Проверка: каждые 30 сек.\n"
         "\n"
-        "Начать: нажми ➕ Добавить и пришли ссылку на профиль Steam.\n"
+        "Как начать:\n"
+        "1. Если нужно, сохрани свой ключ: /setkey КЛЮЧ\n"
+        "2. Нажми ➕ Добавить и пришли ссылку на профиль Steam\n"
         "\n"
+        "Основные команды:\n"
         "/add ссылка — добавить профиль\n"
-        "/list — мой список\n"
-        "/check ссылка — проверить сейчас\n"
-        "/remove ссылка — удалить\n"
-        "/pause /resume ссылка — пауза / возобновить\n"
-        "/rename ссылка новый_ник — переименовать\n"
-        "/setkey КЛЮЧ — свой Steam API ключ\n"
+        "/list — открыть список профилей\n"
+        "/check ссылка — проверить профиль сейчас\n"
+        "/setkey КЛЮЧ — сохранить свой Steam API ключ\n"
         "\n"
         "Вместо ссылки можно писать SteamID64 (17 цифр).\n"
         "Профиль должен быть Public."
@@ -290,14 +290,17 @@ def setup_bot(
     async def cmd_setkey(message: Message) -> None:
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
-            await message.answer("Использование: /setkey API_КЛЮЧ")
+            await message.answer(
+                "Не вижу API ключ.\n"
+                "Отправь команду так: /setkey API_КЛЮЧ"
+            )
             return
 
         api_key = parts[1].strip()
         valid = await steam_client.validate_key(api_key)
         if not valid:
             await message.answer(
-                "Неверный API ключ.\n"
+                "Ключ не подошёл.\n"
                 "Получить: https://steamcommunity.com/dev/apikey"
             )
             return
@@ -305,7 +308,7 @@ def setup_bot(
         from .models import User
         user = User(telegram_id=message.from_user.id, steam_api_key=api_key)
         await db.save_user(db_conn, user)
-        await message.answer("API ключ сохранён. Твои запросы теперь через него.")
+        await message.answer("API ключ сохранён. Теперь бот будет использовать его для твоих запросов.")
 
     # ── Add target (command) ──────────────────────────────────────
 
@@ -314,7 +317,8 @@ def setup_bot(
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
             await message.answer(
-                "Использование: /add ссылка_на_профиль\n"
+                "Нужна ссылка на профиль.\n"
+                "Отправь так: /add ссылка_на_профиль\n"
                 "Пример: /add https://steamcommunity.com/id/gabelogannewell"
             )
             return
@@ -330,7 +334,8 @@ def setup_bot(
 
         if not steam_id and not vanity:
             await message.answer(
-                "Не понял. Пришли ссылку на профиль или SteamID64.\n"
+                "Не понял ссылку.\n"
+                "Пришли ссылку на профиль Steam или SteamID64.\n"
                 "Пример: /add https://steamcommunity.com/id/gabelogannewell"
             )
             return
@@ -340,7 +345,8 @@ def setup_bot(
         api_key = _get_api_key(user.steam_api_key if user else None)
         if not api_key:
             await message.answer(
-                "Нужен API ключ. Добавь: /setkey API_КЛЮЧ\n"
+                "Сначала нужен API ключ.\n"
+                "Сохрани его так: /setkey API_КЛЮЧ\n"
                 "Получить: https://steamcommunity.com/dev/apikey"
             )
             return
@@ -349,7 +355,7 @@ def setup_bot(
         if not steam_id and vanity:
             steam_id = await steam_client.resolve_vanity_url(api_key, vanity)
             if not steam_id:
-                await message.answer("Не удалось найти профиль по этой ссылке.")
+                await message.answer("Не удалось найти профиль по этой ссылке. Проверь, нет ли опечатки.")
                 return
 
         # Fetch profile to get nickname
@@ -377,17 +383,18 @@ def setup_bot(
                 f"Добавлен: {name}\n"
                 f"SteamID: {steam_id}\n"
                 f"Статус: {state_name(profile.persona_state)}\n"
-                f"Мониторинг каждые 30 сек."
+                f"Мониторинг каждые 30 сек.\n"
+                "Дальше можешь открыть список через /list или кнопку ниже."
             )
         except Exception as e:
             logger.error("Failed to add target: %s", e)
-            await message.answer("Не удалось добавить. Возможно уже отслеживаешь.")
+            await message.answer("Не удалось добавить профиль. Возможно, ты уже его отслеживаешь.")
 
     @router.message(Command("remove"))
     async def cmd_remove(message: Message) -> None:
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
-            await message.answer("Использование: /remove ссылка_или_SteamID64")
+            await message.answer("Укажи ссылку или SteamID64: /remove ссылка_или_SteamID64")
             return
 
         steam_id = await _resolve_target_id(db_conn, steam_client, message, parts[1])
@@ -396,15 +403,15 @@ def setup_bot(
 
         removed = await db.remove_target(db_conn, message.from_user.id, steam_id)
         if removed:
-            await message.answer("Удалён.")
+            await message.answer("Профиль удалён из списка.")
         else:
-            await message.answer("Не найден в твоём списке.")
+            await message.answer("Не нашёл такой профиль в твоём списке.")
 
     @router.message(Command("list"))
     async def cmd_list(message: Message) -> None:
         targets = await db.get_targets(db_conn, message.from_user.id)
         if not targets:
-            await message.answer("Список пуст. Нажми ➕ Добавить или отправь /add ссылка_на_профиль")
+            await message.answer("Список пока пуст. Нажми ➕ Добавить или отправь /add ссылка_на_профиль")
             return
 
         for t in targets:
@@ -427,7 +434,7 @@ def setup_bot(
     async def cmd_pause(message: Message) -> None:
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
-            await message.answer("Использование: /pause ссылка_или_SteamID64")
+            await message.answer("Укажи ссылку или SteamID64: /pause ссылка_или_SteamID64")
             return
 
         steam_id = await _resolve_target_id(db_conn, steam_client, message, parts[1])
@@ -436,15 +443,15 @@ def setup_bot(
 
         updated = await db.set_target_active(db_conn, message.from_user.id, steam_id, False)
         if updated:
-            await message.answer("Пауза.")
+            await message.answer("Профиль поставлен на паузу.")
         else:
-            await message.answer("Не найден.")
+            await message.answer("Не нашёл такой профиль.")
 
     @router.message(Command("resume"))
     async def cmd_resume(message: Message) -> None:
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
-            await message.answer("Использование: /resume ссылка_или_SteamID64")
+            await message.answer("Укажи ссылку или SteamID64: /resume ссылка_или_SteamID64")
             return
 
         steam_id = await _resolve_target_id(db_conn, steam_client, message, parts[1])
@@ -453,28 +460,28 @@ def setup_bot(
 
         updated = await db.set_target_active(db_conn, message.from_user.id, steam_id, True)
         if updated:
-            await message.answer("Возобновлён.")
+            await message.answer("Профиль снят с паузы.")
         else:
-            await message.answer("Не найден.")
+            await message.answer("Не нашёл такой профиль.")
 
     @router.message(Command("check"))
     async def cmd_check(message: Message) -> None:
         parts = message.text.split(maxsplit=1)
         if len(parts) < 2:
-            await message.answer("Использование: /check ссылка_или_SteamID64")
+            await message.answer("Укажи ссылку или SteamID64: /check ссылка_или_SteamID64")
             return
 
         user = await db.get_user(db_conn, message.from_user.id)
         api_key = _get_api_key(user.steam_api_key if user else None)
         if not api_key:
-            await message.answer("Нужен API ключ: /setkey API_КЛЮЧ")
+            await message.answer("Сначала сохрани API ключ: /setkey API_КЛЮЧ")
             return
 
         steam_id, vanity = _parse_steam_input(parts[1])
         if not steam_id and vanity:
             steam_id = await steam_client.resolve_vanity_url(api_key, vanity)
         if not steam_id:
-            await message.answer("Не понял ссылку.")
+            await message.answer("Не понял ссылку или SteamID64. Проверь формат и попробуй ещё раз.")
             return
 
         profile = await steam_client.get_player_summaries(api_key, steam_id)

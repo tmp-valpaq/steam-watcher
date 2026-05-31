@@ -17,8 +17,9 @@ def _flatten_button_rows(markup):
 def test_help_text_is_shorter_and_action_oriented():
     text = _help_text()
 
-    assert "Начать: нажми ➕ Добавить" in text
-    assert "Отслеживает: онлайн/оффлайн" in text
+    assert "Как начать:" in text
+    assert "Если нужно, сохрани свой ключ: /setkey КЛЮЧ" in text
+    assert "Что отслеживает: онлайн, игры, невидимку" in text
     assert "добавить профиль" in text
     assert "добавить таргет" not in text
 
