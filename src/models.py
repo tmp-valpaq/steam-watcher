@@ -60,9 +60,10 @@ class MatchInfo:
     match_id: str
     steam_id: str
     game: str  # "dota2", "cs2", etc.
-    start_time: int  # unix timestamp
     duration: int  # seconds
+    start_time: Optional[int] = None  # unix timestamp when available
     hero_name: Optional[str] = None  # for Dota
+    source: str = "opendota"
 
 
 @dataclass

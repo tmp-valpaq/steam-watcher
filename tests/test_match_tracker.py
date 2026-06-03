@@ -1,9 +1,9 @@
 """Tests for src.match_tracker: MatchTracker (OpenDota client)."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.match_tracker import MatchTracker, OPENDOTA_API_BASE
+from src.match_tracker import MatchTracker, OPENDOTA_API_BASE, DOTABUFF_BASE
 from src.models import MatchInfo
 
 
@@ -11,6 +11,8 @@ def _make_mock_session(response_data):
     """Create a mock aiohttp.ClientSession that returns the given response data."""
     mock_response = AsyncMock()
     mock_response.json.return_value = response_data
+    mock_response.text.return_value = ""
+    mock_response.status = 200
     mock_response.raise_for_status = MagicMock()
 
     ctx_mgr = MagicMock()
@@ -31,7 +33,13 @@ def _make_url_routed_session(url_to_data: dict):
                 data = val
                 break
         mock_response = AsyncMock()
-        mock_response.json.return_value = data
+        if isinstance(data, tuple):
+            status, payload = data
+        else:
+            status, payload = 200, data
+        mock_response.json.return_value = payload
+        mock_response.text.return_value = payload if isinstance(payload, str) else ""
+        mock_response.status = status
         mock_response.raise_for_status = MagicMock()
         ctx_mgr = MagicMock()
         ctx_mgr.__aenter__ = AsyncMock(return_value=mock_response)
@@ -161,6 +169,160 @@ class TestGetLastMatch:
             if c.args and c.args[0] == heroes_url
         ]
         assert len(heroes_calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_dotabuff_when_opendota_empty(self):
+        html = """
+        <html><body>
+        <h2>LATEST MATCHES</h2>
+        <a href="/matches/8835491973">match</a>
+        <a href="/heroes/witch-doctor">Witch Doctor</a>
+        <time datetime="2026-06-02T11:22:33Z">1 day ago</time>
+        <span>37:10</span>
+        </body></html>
+        """
+        mock_session = _make_url_routed_session({
+            f"{OPENDOTA_API_BASE}/players/39734273/matches?limit=1": [],
+            f"{DOTABUFF_BASE}/players/39734273": (200, html),
+        })
+        tracker = _make_tracker(mock_session)
+
+        result = await tracker.get_last_match("76561198000000001")
+
+        assert result is not None
+        assert result.match_id == "8835491973"
+        assert result.source == "dotabuff"
+        assert result.hero_name == "Witch Doctor"
+        assert result.duration == 37 * 60 + 10
+        assert result.start_time == 1780399353
+
+
+class TestGetRecentMatches:
+    @pytest.mark.asyncio
+    async def test_recent_matches_use_dotabuff_fallback(self):
+        html = """
+        <html><body>
+        <section>LATEST MATCHES
+          <div>
+            <a href="/matches/8835491973">match</a>
+            <a href="/heroes/witch-doctor">Witch Doctor</a>
+            <time datetime="2026-06-02T11:22:33Z">1 day ago</time>
+            <span>37:10</span>
+          </div>
+          <div>
+            <a href="/matches/8835345201">match</a>
+            <a href="/heroes/grimstroke">Grimstroke</a>
+            <time datetime="2026-06-02T10:10:00Z">1 day ago</time>
+            <span>22:05</span>
+          </div>
+        </section>
+        </body></html>
+        """
+        mock_session = _make_url_routed_session({
+            f"{OPENDOTA_API_BASE}/players/39734273/matches?limit=2": [],
+            f"{DOTABUFF_BASE}/players/39734273": (200, html),
+        })
+        tracker = _make_tracker(mock_session)
+
+        result = await tracker.get_recent_matches("76561198000000001", limit=2)
+
+        assert [m.match_id for m in result] == ["8835491973", "8835345201"]
+        assert [m.source for m in result] == ["dotabuff", "dotabuff"]
+        assert result[0].hero_name == "Witch Doctor"
+        assert result[1].hero_name == "Grimstroke"
+        assert result[0].duration == 37 * 60 + 10
+        assert result[1].duration == 22 * 60 + 5
+
+    def test_parse_dotabuff_browser_rows(self):
+        tracker = _make_tracker(MagicMock())
+        rows = [
+            {
+                "match_id": "8835491973",
+                "hero_name": "Hoodwink",
+                "hero_slug": "hoodwink",
+                "duration_text": "42:35",
+                "duration_sec": 2555,
+                "relative_or_absolute_time": "2026-06-02T11:53:19+00:00",
+            },
+            {
+                "match_id": "8835345201",
+                "hero_name": "",
+                "hero_slug": "drow-ranger",
+                "duration_text": "33:01",
+                "duration_sec": None,
+                "relative_or_absolute_time": "a day ago",
+            },
+        ]
+
+        with patch("src.match_tracker.time.time", return_value=1_800_000_000):
+            result = tracker._parse_dotabuff_browser_rows(rows, "76561198000000001", limit=2)
+
+        assert [m.match_id for m in result] == ["8835491973", "8835345201"]
+        assert result[0].hero_name == "Hoodwink"
+        assert result[0].duration == 2555
+        assert result[0].start_time == 1780401199
+        assert result[1].hero_name == "Drow Ranger"
+        assert result[1].duration == 33 * 60 + 1
+        assert result[1].start_time == 1_800_000_000 - 86400
+        assert result[1].source == "dotabuff"
+
+    @pytest.mark.asyncio
+    async def test_dotabuff_cache_is_scoped_by_limit(self):
+        html = """
+        <html><body>
+        <section>LATEST MATCHES
+          <div>
+            <a href="/matches/8835491973">match</a>
+            <a href="/heroes/witch-doctor">Witch Doctor</a>
+            <time datetime="2026-06-02T11:22:33Z">1 day ago</time>
+            <span>37:10</span>
+          </div>
+          <div>
+            <a href="/matches/8835345201">match</a>
+            <a href="/heroes/grimstroke">Grimstroke</a>
+            <time datetime="2026-06-02T10:10:00Z">1 day ago</time>
+            <span>22:05</span>
+          </div>
+        </section>
+        </body></html>
+        """
+        mock_session = _make_url_routed_session({
+            f"{OPENDOTA_API_BASE}/players/39734273/matches?limit=1": [],
+            f"{OPENDOTA_API_BASE}/players/39734273/matches?limit=2": [],
+            f"{DOTABUFF_BASE}/players/39734273": (200, html),
+        })
+        tracker = _make_tracker(mock_session)
+
+        last_match = await tracker.get_last_match("76561198000000001")
+        recent_matches = await tracker.get_recent_matches("76561198000000001", limit=2)
+
+        assert last_match is not None
+        assert last_match.match_id == "8835491973"
+        assert [m.match_id for m in recent_matches] == ["8835491973", "8835345201"]
+
+    def test_static_dotabuff_parser_does_not_reuse_previous_row_timestamp(self):
+        tracker = _make_tracker(MagicMock())
+        html = """
+        <html><body>
+        <section>LATEST MATCHES
+          <div>
+            <a href="/matches/111">match</a>
+            <a href="/heroes/witch-doctor">Witch Doctor</a>
+            <time datetime="2026-06-02T11:22:33Z">1 day ago</time>
+            <span>37:10</span>
+          </div>
+          <div>
+            <a href="/matches/222">match</a>
+            <a href="/heroes/grimstroke">Grimstroke</a>
+            <span>22:05</span>
+          </div>
+        </section>
+        </body></html>
+        """
+
+        result = tracker._parse_dotabuff_matches(html, "76561198000000001", limit=2)
+
+        assert [m.match_id for m in result] == ["111"]
 
 
 class TestGetLastMatchesBatch:

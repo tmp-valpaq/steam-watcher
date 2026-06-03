@@ -834,10 +834,16 @@ class Watcher:
             except Exception as e:
                 logger.error("Failed to log match activity: %s", e)
 
-            time_ago = format_time_ago(match.start_time)
+            if match.start_time is not None:
+                time_ago = format_time_ago(match.start_time)
+                timing = f"Катал Dota 2 {time_ago}"
+            else:
+                timing = "Засветился матч Dota 2"
+
+            source_suffix = " через Dotabuff" if match.source == "dotabuff" else ""
             message = (
                 f"🕵️ {target.name}: скрытая активность! "
-                f"Катал Dota 2 {time_ago} (матч {match.match_id})"
+                f"{timing}{source_suffix} (матч {match.match_id})"
             )
             # Check per-target invisible alert setting
             target_settings = await db.get_target_settings(self._db, target.id)

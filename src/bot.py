@@ -825,12 +825,13 @@ def setup_bot(
                 matches = await watcher.get_cached_recent_matches(target.steam_id)
                 if matches:
                     lines.append("")
-                    lines.append("🎯 Последние матчи Dota 2 (OpenDota):")
+                    lines.append("🎯 Последние матчи Dota 2:")
                     for m in matches:
-                        ts = format_last_seen(m.start_time)
+                        ts = format_last_seen(m.start_time) if m.start_time else "время скрыто"
                         hero = m.hero_name or "?"
-                        dur = f"{m.duration // 60}мин"
-                        lines.append(f"  {ts} — {hero} ({dur})")
+                        dur = f"{m.duration // 60}мин" if m.duration else "длительность ?"
+                        src = " [Dotabuff]" if m.source == "dotabuff" else ""
+                        lines.append(f"  {ts} — {hero} ({dur}){src}")
             except Exception:
                 pass
 
