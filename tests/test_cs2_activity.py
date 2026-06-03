@@ -6,6 +6,7 @@ import pytest
 
 from src.cs2_activity import (
     CS2ActivityResolver,
+    CSSTATS_USER_AGENT,
     MatchActivity,
     PROVIDER_HTTP_TIMEOUT_SECONDS,
     aggregate_sessions,
@@ -361,7 +362,9 @@ async def test_lookup_csstats_parses_and_sets_hard_timeout():
     assert result.status == "found_recent_activity"
     assert result.last_activity_window is not None
     # An explicit per-call timeout must be supplied to the transport.
-    _, _, timeout = session.calls[0]
+    _, headers, timeout = session.calls[0]
+    assert headers is not None
+    assert headers["user-agent"] == CSSTATS_USER_AGENT
     assert timeout is not None
     assert timeout.total == PROVIDER_HTTP_TIMEOUT_SECONDS
 

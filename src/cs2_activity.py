@@ -33,6 +33,10 @@ RECENCY_STALE_MAX_DAYS = 90
 
 LEETIFY_API_URL = "https://api.cs-prod.leetify.com/api/profile/id/{steam_id}"
 CSSTATS_URL = "https://csstats.gg/player/{steam_id}/stats"
+CSSTATS_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+)
 
 # Hard timeouts so a slow/hung provider can never block a bot handler.
 # Per-provider HTTP call ceiling and an overall whole-lookup ceiling.
@@ -631,6 +635,7 @@ class CS2ActivityResolver:
         profile_url = f"https://csstats.gg/player/{steam_id}"
         url = CSSTATS_URL.format(steam_id=steam_id)
         headers = {
+            "user-agent": CSSTATS_USER_AGENT,
             "x-requested-with": "XMLHttpRequest",
             "referer": profile_url,
             "accept": "*/*",
