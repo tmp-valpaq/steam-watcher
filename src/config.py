@@ -60,6 +60,10 @@ OPENDOTA_BASE = "https://api.opendota.com/api"
 
 DEFAULT_POLL_INTERVAL = 30  # 30 seconds
 
+# Seconds between best-effort Dota match-poll sweeps (offline/invisible targets).
+# Shared by the watcher's poll loop and match_tracker's negative-cache / browser budget.
+MATCH_POLL_INTERVAL = 300
+
 PERSONA_STATES = {
     0: "Offline",
     1: "Online",

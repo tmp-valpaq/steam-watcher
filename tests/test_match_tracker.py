@@ -368,3 +368,88 @@ class TestGetLastMatchesBatch:
             "76561198000000002",
         ])
         assert result == {}
+
+
+def _make_counting_session(response_data, status=200):
+    """Mock session whose .get records a call count via session.call_count."""
+    counter = {"n": 0}
+
+    def get(url, *args, **kwargs):
+        counter["n"] += 1
+        mock_response = AsyncMock()
+        mock_response.json.return_value = response_data
+        mock_response.text.return_value = ""
+        mock_response.status = status
+        mock_response.raise_for_status = MagicMock()
+        ctx_mgr = MagicMock()
+        ctx_mgr.__aenter__ = AsyncMock(return_value=mock_response)
+        ctx_mgr.__aexit__ = AsyncMock(return_value=False)
+        return ctx_mgr
+
+    mock_session = MagicMock()
+    mock_session.get.side_effect = get
+    mock_session.call_counter = counter
+    return mock_session
+
+
+class TestGetPlayerRank:
+    @pytest.mark.asyncio
+    async def test_returns_parsed_dict(self):
+        session = _make_counting_session({
+            "mmr_estimate": {"estimate": 4200},
+            "rank_tier": 54,
+        })
+        tracker = _make_tracker(session)
+        result = await tracker.get_player_rank("76561198000000001")
+        assert result == {"mmr": 4200, "rank_tier": 54}
+
+    @pytest.mark.asyncio
+    async def test_invalid_steam_id_returns_none(self):
+        session = _make_counting_session({})
+        tracker = _make_tracker(session)
+        result = await tracker.get_player_rank("not_a_number")
+        assert result is None
+        # No HTTP request issued for an invalid id.
+        assert session.call_counter["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_non_positive_account_id_returns_none(self):
+        session = _make_counting_session({})
+        tracker = _make_tracker(session)
+        result = await tracker.get_player_rank("100")  # below STEAM_ID_OFFSET
+        assert result is None
+        assert session.call_counter["n"] == 0
+
+    @pytest.mark.asyncio
+    async def test_non_200_returns_none(self):
+        session = _make_counting_session({}, status=429)
+        tracker = _make_tracker(session)
+        result = await tracker.get_player_rank("76561198000000001")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_empty_result_is_cached(self):
+        # Player exists but has no MMR / rank → empty fields, still cached.
+        session = _make_counting_session({"mmr_estimate": None, "rank_tier": None})
+        tracker = _make_tracker(session)
+
+        first = await tracker.get_player_rank("76561198000000001")
+        second = await tracker.get_player_rank("76561198000000001")
+
+        assert first == {"mmr": None, "rank_tier": None}
+        assert second == first
+        # Second call within TTL must not issue another HTTP request.
+        assert session.call_counter["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_positive_result_is_cached(self):
+        session = _make_counting_session({
+            "mmr_estimate": {"estimate": 3000},
+            "rank_tier": 42,
+        })
+        tracker = _make_tracker(session)
+
+        await tracker.get_player_rank("76561198000000001")
+        await tracker.get_player_rank("76561198000000001")
+
+        assert session.call_counter["n"] == 1

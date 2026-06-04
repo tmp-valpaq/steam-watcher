@@ -17,6 +17,19 @@ from src.models import User, Target, TargetState
 
 
 @pytest.mark.asyncio
+class TestInitDbPragmas:
+    async def test_busy_timeout_set(self, db_conn):
+        async with db_conn.execute("PRAGMA busy_timeout") as cur:
+            row = await cur.fetchone()
+        assert row[0] == 5000
+
+    async def test_foreign_keys_enabled(self, db_conn):
+        async with db_conn.execute("PRAGMA foreign_keys") as cur:
+            row = await cur.fetchone()
+        assert row[0] == 1
+
+
+@pytest.mark.asyncio
 class TestUserCRUD:
     async def test_save_and_get_user(self, db_conn):
         user = User(telegram_id=12345, steam_api_key="abc123key")
@@ -160,3 +173,32 @@ class TestTargetStateCRUD:
     async def test_get_nonexistent_state(self, db_conn):
         fetched = await get_target_state(db_conn, 99999)
         assert fetched is None
+
+
+@pytest.mark.asyncio
+class TestRemoveTargetCascade:
+    async def test_remove_target_with_children(self, db_conn):
+        """With foreign_keys=ON, removing a target that has state/settings/
+        activity rows must succeed (no FK violation) and clean up children.
+        A bare DELETE on targets would raise IntegrityError here."""
+        from src.db import save_activity, save_target_settings, get_activity_log
+
+        await save_user(db_conn, User(telegram_id=111, steam_api_key="key"))
+        added = await add_target(
+            db_conn, Target(id=0, telegram_id=111, steam_id="76561198000000009", name="P")
+        )
+        await save_target_state(
+            db_conn, TargetState(target_id=added.id, persona_state=1, playtime_forever=5)
+        )
+        await save_target_settings(db_conn, added.id, {"alert_online": False})
+        await save_activity(db_conn, added.id, "online")
+
+        removed = await remove_target(db_conn, 111, "76561198000000009")
+        assert removed is True
+        assert await get_target_state(db_conn, added.id) is None
+        assert await get_activity_log(db_conn, added.id) == []
+        assert len(await get_targets(db_conn, 111)) == 0
+
+    async def test_remove_nonexistent_returns_false(self, db_conn):
+        await save_user(db_conn, User(telegram_id=111, steam_api_key="key"))
+        assert await remove_target(db_conn, 111, "76561198000000404") is False

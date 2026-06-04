@@ -19,6 +19,7 @@ from .config import (
     DOTABUFF_BROWSER_WAIT_MS,
     DOTABUFF_CACHE_TTL_SEC,
     DOTABUFF_EMPTY_CACHE_TTL_SEC,
+    MATCH_POLL_INTERVAL,
 )
 from .models import MatchInfo
 
@@ -50,13 +51,17 @@ _RELATIVE_TIME_RE = re.compile(
 )
 # Negative ("no matches found") verdicts must outlive a full match-poll cycle,
 # otherwise non-Dota / Cloudflare-gated targets get re-fetched (and re-browsed)
-# on every sweep. The watcher polls matches every 300s, so cache empties for at
-# least that long regardless of the (much shorter) base empty-cache TTL knob.
-_MATCH_POLL_INTERVAL_SEC = 300
+# on every sweep. The watcher polls matches every MATCH_POLL_INTERVAL seconds, so
+# cache empties for at least that long regardless of the (much shorter) base
+# empty-cache TTL knob. Aliased from config so the literal lives in one place.
+_MATCH_POLL_INTERVAL_SEC = MATCH_POLL_INTERVAL
 _NEGATIVE_CACHE_TTL_SEC = max(DOTABUFF_EMPTY_CACHE_TTL_SEC, _MATCH_POLL_INTERVAL_SEC)
 # Upper bound on headless-browser launches per poll cycle, so a sweep of many
 # offline non-Dota targets cannot fan out into many Chromium contexts at once.
 _BROWSER_LAUNCH_BUDGET_PER_CYCLE = 2
+# How long an OpenDota rank lookup (positive OR empty) stays cached. Empties are
+# cached too so MMR-less players aren't re-fetched on every alert.
+_RANK_CACHE_TTL_SEC = 600
 
 _MATCH_LINK_RE = re.compile(r"/matches/(\d+)")
 _HERO_SLUG_RE = re.compile(r"/heroes/([a-z0-9\-]+)")
@@ -73,6 +78,9 @@ class MatchTracker:
         self._session = session
         self._hero_cache: Dict[int, str] = {}
         self._dotabuff_cache: Dict[str, Tuple[float, List[MatchInfo]]] = {}
+        # steam_id -> (expiry_ts, rank_dict_or_None). Caches positive and empty
+        # OpenDota rank lookups so players with no MMR aren't re-fetched per alert.
+        self._rank_cache: Dict[str, Tuple[float, Optional[dict]]] = {}
         self._last_request_time: float = 0.0
         self._min_interval: float = 1.0  # 1 req/sec for OpenDota free tier
         self._dotabuff_browser_enabled: bool = DOTABUFF_BROWSER_ENABLED
@@ -529,6 +537,48 @@ class MatchTracker:
             logger.error("Failed to get OpenDota recent matches for %s: %s", steam_id, e)
 
         return await self._get_recent_matches_dotabuff(steam_id, limit)
+
+    async def get_player_rank(self, steam_id: str) -> Optional[dict]:
+        """Fetch a player's Dota MMR/rank tier from OpenDota.
+
+        Returns {"mmr": Optional[int], "rank_tier": Optional[int]} with the RAW
+        rank_tier int (callers decode it into a human name). Returns None for an
+        invalid steam_id or on any HTTP/parse error. Results — including empty
+        ones — are cached for _RANK_CACHE_TTL_SEC so MMR-less players are not
+        re-fetched on every alert.
+        """
+        account_id = self._to_account_id(steam_id)
+        if account_id is None or account_id <= 0:
+            return None
+
+        now = time.time()
+        cached = self._rank_cache.get(steam_id)
+        if cached and cached[0] > now:
+            return cached[1]
+
+        url = f"{OPENDOTA_API_BASE}/players/{account_id}"
+        try:
+            await self._rate_limit()
+            async with self._session.get(
+                url, timeout=aiohttp.ClientTimeout(total=5)
+            ) as resp:
+                if resp.status != 200:
+                    logger.info("OpenDota rank returned %s for %s", resp.status, steam_id)
+                    return None
+                data = await resp.json()
+        except Exception as e:
+            logger.warning("OpenDota rank fetch failed for %s: %s", steam_id, e)
+            return None
+
+        if not isinstance(data, dict):
+            return None
+
+        mmr_estimate = data.get("mmr_estimate")
+        mmr = mmr_estimate.get("estimate") if isinstance(mmr_estimate, dict) else None
+        rank = {"mmr": mmr, "rank_tier": data.get("rank_tier")}
+        # Cache positive and empty results alike (empty = both fields None).
+        self._rank_cache[steam_id] = (now + _RANK_CACHE_TTL_SEC, rank)
+        return rank
 
     async def get_last_matches_batch(
         self, steam_ids: List[str]

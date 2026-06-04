@@ -230,3 +230,112 @@ class TestGenerateAlertsEventType:
         current = _make_state(persona_name="начал играть в Dota")
         alerts = generate_alerts(target, previous, current, False)
         assert _event_type_of(alerts, "сменил ник") == "name_change"
+
+
+# ── Dota enrichment + blocked-bot handling (Watcher methods) ────────────────
+
+from unittest.mock import AsyncMock, MagicMock
+
+from aiogram.exceptions import TelegramForbiddenError
+from aiogram.methods import SendMessage
+
+from src import db
+from src.models import User
+from src.watcher import Watcher
+
+
+def _make_watcher(db_conn, send_alert, match_tracker=None):
+    steam = MagicMock()
+    steam.get_player_summaries = AsyncMock(return_value=None)
+    steam.get_player_summaries_batch = AsyncMock(return_value={})
+    return Watcher(
+        db_conn=db_conn,
+        steam_client=steam,
+        send_alert=send_alert,
+        match_tracker=match_tracker,
+    )
+
+
+def _forbidden_error():
+    return TelegramForbiddenError(
+        method=SendMessage(chat_id=1, text="x"),
+        message="Forbidden: bot was blocked by the user",
+    )
+
+
+@pytest.mark.asyncio
+class TestEnrichDotaAlert:
+    async def test_enrich_appends_mmr_and_rank(self):
+        target = _make_target(steam_id="76561198000000001")
+        match_tracker = MagicMock()
+        # rank_tier 11 -> Herald 1; mmr 3500
+        match_tracker.get_player_rank = AsyncMock(
+            return_value={"mmr": 3500, "rank_tier": 11}
+        )
+        watcher = _make_watcher(MagicMock(), AsyncMock(), match_tracker)
+
+        enriched = await watcher._enrich_dota_alert(target, "base")
+        assert enriched is not None
+        assert "base" in enriched
+        assert "MMR: 3500" in enriched
+        assert "Ранг: Herald 1" in enriched
+        match_tracker.get_player_rank.assert_awaited_once_with(target.steam_id)
+
+    async def test_enrich_immortal_rank(self):
+        target = _make_target(steam_id="76561198000000001")
+        match_tracker = MagicMock()
+        match_tracker.get_player_rank = AsyncMock(
+            return_value={"mmr": None, "rank_tier": 80}
+        )
+        watcher = _make_watcher(MagicMock(), AsyncMock(), match_tracker)
+
+        enriched = await watcher._enrich_dota_alert(target, "base")
+        assert enriched is not None
+        assert "Ранг: Immortal (rank 0)" in enriched
+        assert "MMR:" not in enriched
+
+    async def test_enrich_returns_none_without_tracker(self):
+        target = _make_target()
+        watcher = _make_watcher(MagicMock(), AsyncMock(), match_tracker=None)
+        assert await watcher._enrich_dota_alert(target, "base") is None
+
+    async def test_enrich_returns_none_when_no_rank(self):
+        target = _make_target(steam_id="76561198000000001")
+        match_tracker = MagicMock()
+        match_tracker.get_player_rank = AsyncMock(
+            return_value={"mmr": None, "rank_tier": None}
+        )
+        watcher = _make_watcher(MagicMock(), AsyncMock(), match_tracker)
+        assert await watcher._enrich_dota_alert(target, "base") is None
+
+
+@pytest.mark.asyncio
+class TestBlockedBotDeactivates:
+    async def test_forbidden_error_deactivates_target(self, db_conn):
+        telegram_id = 999
+        steam_id = "76561198000000777"
+        await db.save_user(db_conn, User(telegram_id=telegram_id, steam_api_key="k"))
+        target = await db.add_target(
+            db_conn,
+            Target(
+                id=0, telegram_id=telegram_id, steam_id=steam_id,
+                name="Blocked", interval_seconds=30, active=True,
+            ),
+        )
+
+        async def _raise(telegram_id, message):
+            raise _forbidden_error()
+
+        watcher = _make_watcher(db_conn, _raise)
+
+        ok = await watcher._send_to_target(target, "hello")
+        assert ok is False
+        # In-memory target object reflects deactivation.
+        assert target.active is False
+
+        # DB reflects deactivation: target no longer active.
+        active = await db.get_active_targets(db_conn)
+        assert all(t.steam_id != steam_id for t in active)
+        stored = await db.get_targets(db_conn, telegram_id)
+        assert len(stored) == 1
+        assert stored[0].active is False

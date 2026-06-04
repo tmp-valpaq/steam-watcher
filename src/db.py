@@ -12,6 +12,17 @@ logger = logging.getLogger(__name__)
 
 async def init_db(db: aiosqlite.Connection) -> None:
     """Initialize the database schema from schema.sql and add missing columns."""
+    # Pragmatic durability/concurrency settings for the single shared connection
+    # used by both the watcher and the bot. WAL allows concurrent reads while a
+    # write is in progress; busy_timeout makes a brief lock wait instead of
+    # erroring; foreign_keys enforces the FK constraints declared in schema.sql
+    # (SQLite ignores them unless explicitly enabled). For :memory: databases
+    # (used in tests) journal_mode=WAL is a no-op and returns 'memory' without
+    # erroring, so this is safe everywhere.
+    await db.execute("PRAGMA journal_mode=WAL")
+    await db.execute("PRAGMA busy_timeout=5000")
+    await db.execute("PRAGMA foreign_keys=ON")
+
     schema_path = os.path.join(os.path.dirname(__file__), "..", "schema.sql")
     async with db.cursor() as cur:
         with open(schema_path, "r") as f:
@@ -92,12 +103,27 @@ async def add_target(db: aiosqlite.Connection, target: Target) -> Target:
 
 
 async def remove_target(db: aiosqlite.Connection, telegram_id: int, steam_id: str) -> bool:
-    cursor = await db.execute(
-        "DELETE FROM targets WHERE telegram_id = ? AND steam_id = ?",
+    """Remove a target together with its dependent rows.
+
+    foreign_keys=ON is enabled (see init_db) but the schema FKs have no
+    ON DELETE CASCADE, so a bare DELETE on targets would fail once child rows
+    exist (state/settings/activity after the first poll). Delete children
+    explicitly — this also prevents orphan rows that used to accumulate.
+    """
+    async with db.execute(
+        "SELECT id FROM targets WHERE telegram_id = ? AND steam_id = ?",
         (telegram_id, steam_id),
-    )
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        return False
+    target_id = row[0]
+    await db.execute("DELETE FROM target_states WHERE target_id = ?", (target_id,))
+    await db.execute("DELETE FROM target_settings WHERE target_id = ?", (target_id,))
+    await db.execute("DELETE FROM activity_log WHERE target_id = ?", (target_id,))
+    await db.execute("DELETE FROM targets WHERE id = ?", (target_id,))
     await db.commit()
-    return cursor.rowcount > 0
+    return True
 
 
 async def get_targets(db: aiosqlite.Connection, telegram_id: int) -> List[Target]:

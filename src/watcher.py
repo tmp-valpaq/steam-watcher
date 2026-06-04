@@ -6,19 +6,17 @@ from datetime import datetime, timezone
 from typing import List, Optional, Callable, Awaitable, Dict
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-import aiohttp
 import aiosqlite
+from aiogram.exceptions import TelegramForbiddenError
 
 from . import db
 from .formatting import format_duration_seconds, format_playtime_minutes
-from .match_tracker import MatchTracker, STEAM_ID_OFFSET
+from .match_tracker import MatchTracker
 from .models import Target, TargetState, Alert
 from .steam import SteamClient, state_name, format_last_seen, detect_invisible
-from .config import VISIBILITY_STATES, DEFAULT_STEAM_API_KEY
+from .config import VISIBILITY_STATES, DEFAULT_STEAM_API_KEY, MATCH_POLL_INTERVAL
 
 logger = logging.getLogger(__name__)
-
-MATCH_POLL_INTERVAL = 300
 
 
 # Known appid → name mapping for popular games
@@ -232,31 +230,16 @@ class Watcher:
         steam_client: SteamClient,
         send_alert: Callable[[int, str], Awaitable[None]],
         match_tracker: Optional[MatchTracker] = None,
-        http_session: Optional[aiohttp.ClientSession] = None,
     ):
         self._db = db_conn
         self._steam = steam_client
         self._send_alert = send_alert
         self._match_tracker = match_tracker
-        # Prefer an explicitly-injected aiohttp session (used by the Dota MMR
-        # enrichment). Fall back to the match_tracker's session for backward
-        # compatibility with callers that don't pass one. The fallback uses a
-        # public accessor when available so we don't reach into private attrs.
-        if http_session is not None:
-            self._http_session: Optional[aiohttp.ClientSession] = http_session
-        elif match_tracker is not None:
-            self._http_session = getattr(match_tracker, "session", None) or getattr(
-                match_tracker, "_session", None
-            )
-        else:
-            self._http_session = None
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._last_match_poll: float = 0.0
         self._last_session_poll: float = 0.0
         self._last_summary_poll: float = 0.0
-        self._opendota_rank_cache: Dict[str, dict] = {}  # steam_id -> rank data
-        self._opendota_cache_ttl: float = 0.0
         self._recent_matches_cache: Dict[str, list] = {}  # steam_id -> list[MatchInfo]
         self._recent_matches_cache_ttl: float = 0.0
         self._last_cleanup_date: str = ""
@@ -540,10 +523,11 @@ class Watcher:
                     enriched = await self._enrich_dota_alert(target, alert.message)
                     if enriched:
                         alert.message = enriched
-            try:
-                await self._send_alert(target.telegram_id, alert.message)
-            except Exception as e:
-                logger.error("Failed to send alert: %s", e)
+            await self._send_to_target(target, alert.message)
+            if not target.active:
+                # User blocked the bot — target was just deactivated; stop
+                # sending the remaining alerts to this unreachable target.
+                break
 
         # Log activity events for history tracking
         await self._log_activity_from_alerts(target, alerts, previous_state, current_state)
@@ -648,13 +632,13 @@ class Watcher:
             duration_str = format_duration_seconds(elapsed)
             message = f"🎮 {name} играет в {state.game_name} ({duration_str})"
 
-            try:
-                await self._send_alert(target.telegram_id, message)
+            if await self._send_to_target(target, message):
                 # Update last_session_update
                 state.last_session_update = now
-                await db.save_target_state(self._db, state)
-            except Exception as e:
-                logger.error("Failed to send session update: %s", e)
+                try:
+                    await db.save_target_state(self._db, state)
+                except Exception as e:
+                    logger.error("Failed to send session update: %s", e)
 
     async def _send_daily_summaries(self) -> None:
         """Send daily playtime summaries to users who are due."""
@@ -732,78 +716,79 @@ class Watcher:
             except Exception as e:
                 logger.error("Failed to send daily summary for %s: %s", telegram_id, e)
 
+    async def _send_to_target(self, target: Target, message: str) -> bool:
+        """Send a message tied to a specific target.
+
+        On a regular send failure we log and return False. If the user has
+        blocked the bot (TelegramForbiddenError), polling that target is
+        pointless forever, so we deactivate it and return False.
+        """
+        try:
+            await self._send_alert(target.telegram_id, message)
+            return True
+        except TelegramForbiddenError:
+            logger.info(
+                "Bot blocked by %s; deactivating target %s",
+                target.telegram_id,
+                target.name,
+            )
+            try:
+                await db.set_target_active(
+                    self._db, target.telegram_id, target.steam_id, False
+                )
+                target.active = False
+            except Exception as e:
+                logger.error("Failed to deactivate blocked target %s: %s", target.name, e)
+            return False
+        except Exception as e:
+            logger.error("Failed to send alert: %s", e)
+            return False
+
     async def _enrich_dota_alert(self, target: Target, base_message: str) -> Optional[str]:
-        """Fetch Dota 2 MMR/rank from OpenDota and append to alert message."""
-        steam_id = target.steam_id
-        now = time.time()
-
-        # Cache for 10 minutes
-        if now < self._opendota_cache_ttl or steam_id in self._opendota_rank_cache:
-            cached = self._opendota_rank_cache.get(steam_id)
-            if cached:
-                parts = [base_message]
-                if cached.get("mmr"):
-                    parts.append(f"MMR: {cached['mmr']}")
-                if cached.get("rank_tier"):
-                    parts.append(f"Ранг: {cached['rank_tier']}")
-                return "\n".join(parts)
-
-        # Only refresh cache if expired
-        if now >= self._opendota_cache_ttl:
-            self._opendota_rank_cache.clear()
-            self._opendota_cache_ttl = now + 600
-
-        if self._http_session is None:
+        """Append Dota 2 MMR/rank to an alert via the match tracker's rank lookup."""
+        if self._match_tracker is None:
             return None
 
         try:
-            account_id = int(steam_id) - STEAM_ID_OFFSET
-            url = f"https://api.opendota.com/api/players/{account_id}"
-
-            async with self._http_session.get(
-                url, timeout=aiohttp.ClientTimeout(total=5)
-            ) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json()
-
-            mmr = data.get("mmr_estimate", {}).get("estimate")
-            rank_tier = data.get("rank_tier")
-
-            if mmr or rank_tier:
-                rank_info = {}
-                if mmr:
-                    rank_info["mmr"] = mmr
-                # Decode rank_tier: first digit = rank (Herald=1..Divine=8), second = star
-                if rank_tier:
-                    rank_names = {
-                        1: "Herald", 2: "Guardian", 3: "Crusader", 4: "Archon",
-                        5: "Legend", 6: "Ancient", 7: "Divine", 8: "Immortal",
-                    }
-                    rank_num = rank_tier // 10
-                    stars = rank_tier % 10
-                    if rank_num in rank_names:
-                        if rank_num == 8:
-                            rank_str = f"Immortal (rank {stars})"
-                        else:
-                            rank_str = f"{rank_names[rank_num]} {stars}"
-                        rank_info["rank_tier"] = rank_str
-                    else:
-                        rank_info["rank_tier"] = str(rank_tier)
-
-                self._opendota_rank_cache[steam_id] = rank_info
-                parts = [base_message]
-                if rank_info.get("mmr"):
-                    parts.append(f"MMR: {rank_info['mmr']}")
-                if rank_info.get("rank_tier"):
-                    parts.append(f"Ранг: {rank_info['rank_tier']}")
-                return "\n".join(parts)
-
-            self._opendota_rank_cache[steam_id] = {}
+            rank = await self._match_tracker.get_player_rank(target.steam_id)
         except Exception as e:
             logger.error("OpenDota enrich failed for %s: %s", target.name, e)
+            return None
 
-        return None
+        if not rank:
+            return None
+
+        mmr = rank.get("mmr")
+        rank_tier = rank.get("rank_tier")
+        if not (mmr or rank_tier):
+            return None
+
+        rank_info = {}
+        if mmr:
+            rank_info["mmr"] = mmr
+        # Decode rank_tier: first digit = rank (Herald=1..Divine=8), second = star
+        if rank_tier:
+            rank_names = {
+                1: "Herald", 2: "Guardian", 3: "Crusader", 4: "Archon",
+                5: "Legend", 6: "Ancient", 7: "Divine", 8: "Immortal",
+            }
+            rank_num = rank_tier // 10
+            stars = rank_tier % 10
+            if rank_num in rank_names:
+                if rank_num == 8:
+                    rank_str = f"Immortal (rank {stars})"
+                else:
+                    rank_str = f"{rank_names[rank_num]} {stars}"
+                rank_info["rank_tier"] = rank_str
+            else:
+                rank_info["rank_tier"] = str(rank_tier)
+
+        parts = [base_message]
+        if rank_info.get("mmr"):
+            parts.append(f"MMR: {rank_info['mmr']}")
+        if rank_info.get("rank_tier"):
+            parts.append(f"Ранг: {rank_info['rank_tier']}")
+        return "\n".join(parts)
 
     async def _poll_matches(self) -> None:
         """Best-effort poll for new Dota 2 matches on offline/invisible targets."""
@@ -875,7 +860,4 @@ class Watcher:
             # Check per-target invisible alert setting
             target_settings = await db.get_target_settings(self._db, target.id)
             if target_settings.get("alert_invisible", True):
-                try:
-                    await self._send_alert(target.telegram_id, message)
-                except Exception as e:
-                    logger.error("Failed to send hidden_activity alert: %s", e)
+                await self._send_to_target(target, message)
