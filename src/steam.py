@@ -11,6 +11,20 @@ from .models import SteamProfile
 logger = logging.getLogger(__name__)
 
 
+def _safe_error(e: BaseException) -> str:
+    """Describe an exception without leaking the request URL/params.
+
+    The Steam API key is passed as a query param, and aiohttp's
+    ClientResponseError.__str__ includes the full request URL (with the key).
+    Logging the raw exception would leak the key, so we only surface the
+    exception type and HTTP status (when available).
+    """
+    status = getattr(e, "status", None)
+    if status is not None:
+        return f"{type(e).__name__}: HTTP {status}"
+    return type(e).__name__
+
+
 def state_name(persona_state: int) -> str:
     """Convert persona_state integer to human-readable name."""
     return PERSONA_STATES.get(persona_state, f"Unknown ({persona_state})")
@@ -92,7 +106,9 @@ class SteamClient:
                 visibility_state=p.get("communityvisibilitystate", 3),
             )
         except Exception as e:
-            logger.error("Failed to get player summary for %s: %s", steam_id, e)
+            logger.error(
+                "Failed to get player summary for %s: %s", steam_id, _safe_error(e)
+            )
             return None
 
     async def get_player_summaries_batch(
@@ -128,7 +144,7 @@ class SteamClient:
                 )
             return result
         except Exception as e:
-            logger.error("Failed to get batch player summaries: %s", e)
+            logger.error("Failed to get batch player summaries: %s", _safe_error(e))
             return {}
 
     async def resolve_vanity_url(self, api_key: str, vanity: str) -> Optional[str]:
@@ -142,7 +158,9 @@ class SteamClient:
                 return response.get("steamid")
             return None
         except Exception as e:
-            logger.error("Failed to resolve vanity URL %s: %s", vanity, e)
+            logger.error(
+                "Failed to resolve vanity URL %s: %s", vanity, _safe_error(e)
+            )
             return None
 
     async def validate_key(self, api_key: str) -> bool:

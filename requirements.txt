@@ -2,5 +2,3 @@ aiogram>=3,<4
 aiohttp>=3.9,<3.12
 aiosqlite
 playwright>=1.52,<2
-pytest
-pytest-asyncio

@@ -10,10 +10,11 @@ import aiohttp
 import aiosqlite
 
 from . import db
-from .match_tracker import MatchTracker
+from .formatting import format_duration_seconds, format_playtime_minutes
+from .match_tracker import MatchTracker, STEAM_ID_OFFSET
 from .models import Target, TargetState, Alert
 from .steam import SteamClient, state_name, format_last_seen, detect_invisible
-from .config import VISIBILITY_STATES
+from .config import VISIBILITY_STATES, DEFAULT_STEAM_API_KEY
 
 logger = logging.getLogger(__name__)
 
@@ -58,17 +59,9 @@ def format_time_ago(timestamp: int) -> str:
     return f"{delta // 86400} дн назад"
 
 
-def format_duration_seconds(seconds: int) -> str:
-    """Format duration in seconds to 'Xч Yмин' string."""
-    if seconds < 60:
-        return f"{seconds}с"
-    minutes = seconds // 60
-    secs = seconds % 60
-    if minutes < 60:
-        return f"{minutes}мин {secs}с"
-    hours = minutes // 60
-    mins = minutes % 60
-    return f"{hours}ч {mins}мин"
+def _is_dota_game(game_name: Optional[str]) -> bool:
+    """True if the game name refers to Dota 2 (used to gate MMR enrichment)."""
+    return bool(game_name) and "Dota" in game_name
 
 
 def generate_alerts(
@@ -93,11 +86,15 @@ def generate_alerts(
             alerts.append(Alert(
                 target=target,
                 message=f"{name}: первая проверка. {status}, играет: {current_state.game_name}",
+                event_type="first_check",
+                game_name=current_state.game_name,
+                is_dota=_is_dota_game(current_state.game_name),
             ))
         else:
             alerts.append(Alert(
                 target=target,
                 message=f"{name}: первая проверка. Статус: {status}",
+                event_type="first_check",
             ))
         return alerts
 
@@ -106,10 +103,13 @@ def generate_alerts(
 
     # Invisible
     if is_invisible:
+        invisible_game_name = None
         if grown_games:
             top = grown_games[0]
             game_name = _appid_to_name(top["appid"], game_name_cache)
-            delta_min = top["delta"]
+            invisible_game_name = game_name
+            # delta is stored in SECONDS; display minutes (>=1).
+            delta_min = max(1, top["delta"] // 60)
             alert_msg = (
                 f"👻 {name}: НЕВИДИМКА! Играет в {game_name} "
                 f"(+{delta_min} мин)"
@@ -118,7 +118,8 @@ def generate_alerts(
             if len(grown_games) > 1:
                 others = []
                 for g in grown_games[1:3]:  # max 2 more
-                    others.append(f"{_appid_to_name(g['appid'], game_name_cache)} (+{g['delta']} мин)")
+                    g_min = max(1, g["delta"] // 60)
+                    others.append(f"{_appid_to_name(g['appid'], game_name_cache)} (+{g_min} мин)")
                 if others:
                     alert_msg += "\nТакже: " + ", ".join(others)
         else:
@@ -127,7 +128,13 @@ def generate_alerts(
                 f"но наиграно {current_state.playtime_forever} мин "
                 f"(было {previous_state.playtime_forever})"
             )
-        alerts.append(Alert(target=target, message=alert_msg))
+        alerts.append(Alert(
+            target=target,
+            message=alert_msg,
+            event_type="invisible",
+            game_name=invisible_game_name,
+            is_dota=_is_dota_game(invisible_game_name),
+        ))
 
     # Visibility change
     if (
@@ -138,6 +145,7 @@ def generate_alerts(
         alerts.append(Alert(
             target=target,
             message=f"🔒 {name} изменил видимость профиля: {vis_name}",
+            event_type="visibility_change",
         ))
 
     # Status change
@@ -146,12 +154,14 @@ def generate_alerts(
             alerts.append(Alert(
                 target=target,
                 message=f"🟢 {name} зашёл онлайн. {curr_status}",
+                event_type="online",
             ))
         else:
             last_seen = format_last_seen(current_state.last_logoff)
             alerts.append(Alert(
                 target=target,
                 message=f"⚫ {name} вышел оффлайн. Был {prev_status}. Последний раз: {last_seen}",
+                event_type="offline",
             ))
 
     # Game change
@@ -169,10 +179,16 @@ def generate_alerts(
             alerts.append(Alert(
                 target=target,
                 message=f"⏹ {name} перестал играть в {previous_game}{duration_str}",
+                event_type="game_stop",
+                game_name=previous_game,
+                is_dota=_is_dota_game(previous_game),
             ))
         alerts.append(Alert(
             target=target,
             message=f"🎮 {name} начал играть в {current_game}",
+            event_type="game_start",
+            game_name=current_game,
+            is_dota=_is_dota_game(current_game),
         ))
     elif previous_game and not current_game:
         # Stopped playing entirely
@@ -184,6 +200,9 @@ def generate_alerts(
         alerts.append(Alert(
             target=target,
             message=f"⏹ {name} перестал играть в {previous_game}{duration_str}",
+            event_type="game_stop",
+            game_name=previous_game,
+            is_dota=_is_dota_game(previous_game),
         ))
 
     # Persona name change
@@ -198,6 +217,7 @@ def generate_alerts(
                 f"{name} сменил ник: "
                 f"{previous_state.persona_name} → {current_state.persona_name}"
             ),
+            event_type="name_change",
         ))
 
     return alerts
@@ -212,14 +232,24 @@ class Watcher:
         steam_client: SteamClient,
         send_alert: Callable[[int, str], Awaitable[None]],
         match_tracker: Optional[MatchTracker] = None,
+        http_session: Optional[aiohttp.ClientSession] = None,
     ):
         self._db = db_conn
         self._steam = steam_client
         self._send_alert = send_alert
         self._match_tracker = match_tracker
-        self._http_session: Optional[aiohttp.ClientSession] = (
-            match_tracker._session if match_tracker is not None else None
-        )
+        # Prefer an explicitly-injected aiohttp session (used by the Dota MMR
+        # enrichment). Fall back to the match_tracker's session for backward
+        # compatibility with callers that don't pass one. The fallback uses a
+        # public accessor when available so we don't reach into private attrs.
+        if http_session is not None:
+            self._http_session: Optional[aiohttp.ClientSession] = http_session
+        elif match_tracker is not None:
+            self._http_session = getattr(match_tracker, "session", None) or getattr(
+                match_tracker, "_session", None
+            )
+        else:
+            self._http_session = None
         self._task: Optional[asyncio.Task] = None
         self._running = False
         self._last_match_poll: float = 0.0
@@ -322,12 +352,10 @@ class Watcher:
             user = await db.get_user(self._db, telegram_id)
             if user is None:
                 # Use default API key for users without their own
-                from .config import DEFAULT_STEAM_API_KEY
                 api_key = DEFAULT_STEAM_API_KEY
                 if not api_key:
                     continue
             else:
-                from .config import DEFAULT_STEAM_API_KEY
                 api_key = user.steam_api_key or DEFAULT_STEAM_API_KEY
                 if not api_key:
                     continue
@@ -387,13 +415,24 @@ class Watcher:
             except (json.JSONDecodeError, TypeError):
                 pass
 
-        # Start current playtimes from previous; increment for the actively playing game
+        # Start current playtimes from previous; increment for the actively
+        # playing game. Stored unit is SECONDS (see model/readers).
+        # We accumulate REAL elapsed wall-time since the previous check rather
+        # than a fixed interval, and we do NOT gate on persona_state — Steam can
+        # expose a game while reporting offline (persona_state == 0), and that
+        # is exactly the invisible-playtime case detect_invisible() must catch.
         current_game_pts = dict(prev_game_pts)
-        if profile.game_id and profile.persona_state > 0:
+        if profile.game_id:
             appid = str(profile.game_id)
-            interval_minutes = target.interval_seconds // 60
-            if interval_minutes > 0:
-                current_game_pts[appid] = current_game_pts.get(appid, 0) + interval_minutes
+            if previous_state and previous_state.last_checked:
+                elapsed = now - previous_state.last_checked
+                # Cap so downtime (e.g. bot was offline for hours) doesn't
+                # create a huge jump, and guard against clock skew.
+                elapsed = max(0, min(elapsed, target.interval_seconds * 3))
+            else:
+                elapsed = 0
+            if elapsed > 0:
+                current_game_pts[appid] = current_game_pts.get(appid, 0) + elapsed
 
         total_playtime = sum(current_game_pts.values())
 
@@ -410,8 +449,17 @@ class Watcher:
             # Not playing anymore, clear game_start_time (will be used for duration calc in alerts)
             pass
 
-        # Initialize daily_playtime_snapshot if needed
-        today_str = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+        # Initialize daily_playtime_snapshot if needed.
+        # The "day" boundary must use the user's timezone so it lines up with
+        # the day window used by get_users_due_summary / _send_daily_summaries
+        # (which also compute "today" in the user's tz). Using UTC here would
+        # misalign the reset for non-UTC users.
+        summary_settings = await db.get_user_settings(self._db, target.telegram_id)
+        try:
+            user_tz = ZoneInfo(summary_settings.timezone)
+        except ZoneInfoNotFoundError:
+            user_tz = ZoneInfo("UTC")
+        today_str = datetime.now(tz=user_tz).strftime("%Y-%m-%d")
         daily_playtime_snapshot = previous_state.daily_playtime_snapshot if previous_state else None
         if daily_playtime_snapshot is None:
             # First ever check — snapshot current playtimes
@@ -420,10 +468,10 @@ class Watcher:
             # Check if snapshot is from a previous day
             try:
                 # We don't store the date of the snapshot directly, so we check
-                # by comparing against last_checked date
+                # by comparing against last_checked date (in the user's tz).
                 if previous_state and previous_state.last_checked:
                     snapshot_date = datetime.fromtimestamp(
-                        previous_state.last_checked, tz=timezone.utc
+                        previous_state.last_checked, tz=user_tz
                     ).strftime("%Y-%m-%d")
                     if snapshot_date != today_str:
                         daily_playtime_snapshot = json.dumps(current_game_pts)
@@ -463,7 +511,7 @@ class Watcher:
         target_settings = await db.get_target_settings(self._db, target.id)
         for alert in alerts:
             # Check privacy alerts setting (global toggle)
-            if "изменил видимость" in alert.message:
+            if alert.event_type == "visibility_change":
                 settings = await db.get_user_settings(self._db, target.telegram_id)
                 if not settings.privacy_alerts_enabled:
                     continue
@@ -472,22 +520,21 @@ class Watcher:
                     continue
 
             # Per-target alert type filtering
-            msg = alert.message
-            if "зашёл онлайн" in msg or "вышел оффлайн" in msg:
+            if alert.event_type in ("online", "offline"):
                 if not target_settings.get("alert_online", True):
                     continue
-            if "начал играть" in msg or "перестал играть" in msg:
+            if alert.event_type in ("game_start", "game_stop"):
                 if not target_settings.get("alert_game_start", True):
                     continue
-            if "НЕВИДИМКА" in msg or "скрытая активность" in msg:
+            if alert.event_type == "invisible":
                 if not target_settings.get("alert_invisible", True):
                     continue
-            if "сменил ник" in msg:
+            if alert.event_type == "name_change":
                 if not target_settings.get("alert_name_change", True):
                     continue
 
             # Enrich Dota 2 "started playing" alerts with MMR/rank
-            if "начал играть" in alert.message and "Dota" in alert.message:
+            if alert.event_type == "game_start" and alert.is_dota:
                 # Check per-target MMR setting — skip enrichment but still send base alert
                 if target_settings.get("alert_mmr", True):
                     enriched = await self._enrich_dota_alert(target, alert.message)
@@ -509,33 +556,26 @@ class Watcher:
         """Persist key state-change events to activity_log based on generated alerts."""
         now = int(time.time())
         entries = []
+        # Only these structured event types are persisted to activity_log.
+        loggable = {"online", "offline", "game_start", "game_stop", "name_change", "invisible"}
         for alert in alerts:
-            msg = alert.message
-            event_type = None
+            event_type = alert.event_type if alert.event_type in loggable else None
             game_name = None
             details = None
 
-            if "зашёл онлайн" in msg:
-                event_type = "online"
-            elif "вышел оффлайн" in msg:
-                event_type = "offline"
-            elif "начал играть" in msg:
-                event_type = "game_start"
+            if event_type == "game_start":
                 game_name = curr.game_name
-            elif "перестал играть" in msg:
-                event_type = "game_stop"
+            elif event_type == "game_stop":
                 if prev and prev.game_name:
                     game_name = prev.game_name
                 if prev and prev.game_start_time:
                     elapsed = now - prev.game_start_time
                     if elapsed > 0:
                         details = format_duration_seconds(elapsed)
-            elif "сменил ник" in msg:
-                event_type = "name_change"
+            elif event_type == "name_change":
                 if prev:
                     details = f"{prev.persona_name} → {curr.persona_name}"
-            elif "НЕВИДИМКА" in msg:
-                event_type = "invisible"
+            elif event_type == "invisible":
                 if curr.game_name:
                     game_name = curr.game_name
 
@@ -637,7 +677,7 @@ class Watcher:
                     continue
 
                 # Aggregate playtime across all active targets
-                aggregated: Dict[str, int] = {}  # game_name -> minutes played today
+                aggregated: Dict[str, int] = {}  # game_name -> seconds played today
 
                 for target in targets:
                     if not target.active:
@@ -675,33 +715,22 @@ class Watcher:
                     await db.mark_summary_sent(self._db, telegram_id, today_str)
                     continue
 
-                # Build summary message
+                # Build summary message. Aggregated values are SECONDS; the
+                # formatter takes minutes, so convert at the boundary.
                 lines = ["📊 Ежедневная сводка", ""]
                 sorted_games = sorted(aggregated.items(), key=lambda x: x[1], reverse=True)
-                for game_name, minutes in sorted_games[:10]:
-                    lines.append(f"• {game_name}: {_format_playtime_minutes(minutes)}")
+                for game_name, seconds in sorted_games[:10]:
+                    lines.append(f"• {game_name}: {format_playtime_minutes(seconds // 60)}")
 
                 total = sum(aggregated.values())
                 lines.append("")
-                lines.append(f"Всего: {_format_playtime_minutes(total)}")
+                lines.append(f"Всего: {format_playtime_minutes(total // 60)}")
 
                 await self._send_alert(telegram_id, "\n".join(lines))
                 await db.mark_summary_sent(self._db, telegram_id, today_str)
 
             except Exception as e:
                 logger.error("Failed to send daily summary for %s: %s", telegram_id, e)
-
-    @staticmethod
-    def _format_playtime_minutes(minutes: int) -> str:
-        """Format playtime in minutes to 'Xч Yмин' string."""
-        hours = minutes // 60
-        mins = minutes % 60
-        if hours > 0 and mins > 0:
-            return f"{hours}ч {mins}мин"
-        elif hours > 0:
-            return f"{hours}ч"
-        else:
-            return f"{mins}мин"
 
     async def _enrich_dota_alert(self, target: Target, base_message: str) -> Optional[str]:
         """Fetch Dota 2 MMR/rank from OpenDota and append to alert message."""
@@ -728,8 +757,6 @@ class Watcher:
             return None
 
         try:
-            from .match_tracker import STEAM_ID_OFFSET
-
             account_id = int(steam_id) - STEAM_ID_OFFSET
             url = f"https://api.opendota.com/api/players/{account_id}"
 

@@ -43,16 +43,3 @@ def mock_steam_profile():
         )
 
     return _make
-
-
-@pytest.fixture
-def mock_recent_games():
-    """Return a factory for mock RecentGames objects."""
-    from src.models import RecentGames
-
-    def _make(steam_id="76561198000000001", games=None):
-        if games is None:
-            games = []
-        return RecentGames(steam_id=steam_id, games=games)
-
-    return _make

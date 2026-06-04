@@ -1,18 +1,25 @@
 import logging
 import re
+import time
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional
 
-from aiogram import Bot, Dispatcher, Router, types, F
+from aiogram import Bot, BaseMiddleware, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message, CallbackQuery, ReplyKeyboardMarkup, KeyboardButton, \
-    ReplyKeyboardRemove, ForceReply
+    ReplyKeyboardRemove, ForceReply, TelegramObject
 from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 import aiosqlite
 
 from . import db
-from .config import DEFAULT_STEAM_API_KEY, DEFAULT_POLL_INTERVAL
+from .config import (
+    DEFAULT_STEAM_API_KEY,
+    DEFAULT_POLL_INTERVAL,
+    ALLOWED_TELEGRAM_IDS,
+    CHECK_MIN_INTERVAL_SEC,
+)
+from .formatting import format_duration_seconds
 from .models import Target, TargetState, UserSettings
 from .steam import SteamClient, state_name, format_last_seen
 from .cs2_activity import CS2ActivityResolver, format_cs2_activity_lines
@@ -21,6 +28,55 @@ logger = logging.getLogger(__name__)
 
 router = Router()
 
+# Per-user timestamp of the last expensive Steam-hitting action, for anti-flood.
+_last_check_at: Dict[int, float] = {}
+
+
+class AllowlistMiddleware(BaseMiddleware):
+    """Reject updates from users not on the allowlist.
+
+    When ALLOWED_TELEGRAM_IDS is empty the middleware is a no-op (open to all),
+    preserving the original behavior.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        if not ALLOWED_TELEGRAM_IDS:
+            return await handler(event, data)
+
+        user = data.get("event_from_user")
+        if user is not None and user.id in ALLOWED_TELEGRAM_IDS:
+            return await handler(event, data)
+
+        # Politely refuse without invoking the handler (no Steam access).
+        refusal = "Извини, у тебя нет доступа к этому боту."
+        if isinstance(event, CallbackQuery):
+            await event.answer(refusal, show_alert=True)
+        elif isinstance(event, Message):
+            await event.answer(refusal)
+        return None
+
+
+def _check_too_soon(telegram_id: int) -> bool:
+    """Anti-flood for expensive Steam actions.
+
+    Returns True if the user must wait (called too soon). On a permitted call it
+    records the current time so the next call is throttled. Disabled when the
+    configured interval is <= 0.
+    """
+    if CHECK_MIN_INTERVAL_SEC <= 0:
+        return False
+    now = time.monotonic()
+    last = _last_check_at.get(telegram_id)
+    if last is not None and (now - last) < CHECK_MIN_INTERVAL_SEC:
+        return True
+    _last_check_at[telegram_id] = now
+    return False
+
 # Regex to extract SteamID64 or vanity name from a Steam profile URL
 STEAM_URL_RE = re.compile(
     r"(?:https?://)?steamcommunity\.com/(?:profiles/(\d{17})|id/([a-zA-Z0-9_-]+))"
@@ -28,9 +84,6 @@ STEAM_URL_RE = re.compile(
 
 # Per-user pending states for button-driven flows
 _pending_add: Dict[int, bool] = {}
-
-# OpenDota account_id → SteamID64 conversion
-STEAM_ID64_BASE = 76561197960265728
 
 # Common timezones offered in the settings picker. Stdlib zoneinfo names.
 TIMEZONES = [
@@ -118,29 +171,25 @@ def _is_cancel_text(text: str) -> bool:
     return normalized in {"отмена", "cancel", "/cancel"}
 
 
-def _format_playtime(minutes: int) -> str:
-    """Format playtime in minutes to 'Xч Yмин' string."""
-    hours = minutes // 60
-    mins = minutes % 60
-    if hours > 0 and mins > 0:
-        return f"{hours}ч {mins}мин"
-    elif hours > 0:
-        return f"{hours}ч"
-    else:
-        return f"{mins}мин"
+def render_target_card(target: Target, state: Optional[TargetState]) -> str:
+    """Render the one-line 'name [marker]: status' target card.
 
-
-def _format_duration(seconds: int) -> str:
-    """Format duration in seconds to human-readable string."""
-    if seconds < 60:
-        return f"{seconds}с"
-    minutes = seconds // 60
-    secs = seconds % 60
-    if minutes < 60:
-        return f"{minutes}мин {secs}с"
-    hours = minutes // 60
-    mins = minutes % 60
-    return f"{hours}ч {mins}мин"
+    Centralizes the status/marker formatting copy-pasted across the list and
+    callback handlers. Output is identical to the previous inline blocks:
+    a paused target shows "Пауза"; an active target shows its persona-state
+    name (plus ", играет: <game>" when in a game), or "Ещё не проверен" when
+    no state has been recorded yet.
+    """
+    status = "Пауза"
+    if target.active:
+        if state:
+            status = state_name(state.persona_state)
+            if state.game_name:
+                status += f", играет: {state.game_name}"
+        else:
+            status = "Ещё не проверен"
+    marker = "активен" if target.active else "пауза"
+    return f"{target.name} [{marker}]: {status}"
 
 
 def _build_target_keyboard(target: Target) -> types.InlineKeyboardMarkup:
@@ -340,6 +389,10 @@ def setup_bot(
             )
             return
 
+        if _check_too_soon(message.from_user.id):
+            await message.answer("Слишком часто, подожди пару секунд.")
+            return
+
         # Get API key
         user = await db.get_user(db_conn, message.from_user.id)
         api_key = _get_api_key(user.steam_api_key if user else None)
@@ -416,16 +469,7 @@ def setup_bot(
 
         for t in targets:
             state = await db.get_target_state(db_conn, t.id)
-            status = "Пауза"
-            if t.active:
-                if state:
-                    status = state_name(state.persona_state)
-                    if state.game_name:
-                        status += f", играет: {state.game_name}"
-                else:
-                    status = "Ещё не проверен"
-            marker = "активен" if t.active else "пауза"
-            text = f"{t.name} [{marker}]: {status}"
+            text = render_target_card(t, state)
 
             keyboard = _build_target_keyboard(t)
             await message.answer(text, reply_markup=keyboard)
@@ -471,6 +515,10 @@ def setup_bot(
             await message.answer("Укажи ссылку или SteamID64: /check ссылка_или_SteamID64")
             return
 
+        if _check_too_soon(message.from_user.id):
+            await message.answer("Слишком часто, подожди пару секунд.")
+            return
+
         user = await db.get_user(db_conn, message.from_user.id)
         api_key = _get_api_key(user.steam_api_key if user else None)
         if not api_key:
@@ -496,7 +544,9 @@ def setup_bot(
         ]
         if profile.game_name:
             lines.append(f"Играет: {profile.game_name}")
-        if profile.last_logoff:
+        # last_logoff is the last LOGOFF time — only meaningful when the player
+        # is currently offline. Showing it for an online player is misleading.
+        if profile.persona_state == 0 and profile.last_logoff:
             lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
         await _append_cs2_activity(lines, steam_id)
 
@@ -541,16 +591,7 @@ def setup_bot(
 
         for t in targets:
             state = await db.get_target_state(db_conn, t.id)
-            status = "Пауза"
-            if t.active:
-                if state:
-                    status = state_name(state.persona_state)
-                    if state.game_name:
-                        status += f", играет: {state.game_name}"
-                else:
-                    status = "Ещё не проверен"
-            marker = "активен" if t.active else "пауза"
-            text = f"{t.name} [{marker}]: {status}"
+            text = render_target_card(t, state)
 
             keyboard = _build_target_keyboard(t)
             await message.answer(text, reply_markup=keyboard)
@@ -611,6 +652,10 @@ def setup_bot(
         target.active = False
         keyboard = _build_target_keyboard(target)
         state = await db.get_target_state(db_conn, target.id)
+        # Note: this intentionally still shows the LIVE status (not "Пауза")
+        # alongside the "пауза" marker, so the user sees what the target was
+        # doing at the moment of pausing. render_target_card() would force
+        # "Пауза" for an inactive target, so it is deliberately not used here.
         status = "Пауза"
         if state:
             status = state_name(state.persona_state)
@@ -633,13 +678,7 @@ def setup_bot(
         target.active = True
         keyboard = _build_target_keyboard(target)
         state = await db.get_target_state(db_conn, target.id)
-        status = "Ещё не проверен"
-        if state:
-            status = state_name(state.persona_state)
-            if state.game_name:
-                status += f", играет: {state.game_name}"
-        marker = "активен"
-        text = f"{target.name} [{marker}]: {status}"
+        text = render_target_card(target, state)
         await callback.message.edit_text(text, reply_markup=keyboard)
 
     @router.callback_query(F.data.startswith("remove:"))
@@ -678,16 +717,7 @@ def setup_bot(
 
         await callback.answer("Отменено.")
         state = await db.get_target_state(db_conn, target.id)
-        status = "Пауза"
-        if target.active:
-            if state:
-                status = state_name(state.persona_state)
-                if state.game_name:
-                    status += f", играет: {state.game_name}"
-            else:
-                status = "Ещё не проверен"
-        marker = "активен" if target.active else "пауза"
-        text = f"{target.name} [{marker}]: {status}"
+        text = render_target_card(target, state)
         keyboard = _build_target_keyboard(target)
         await callback.message.edit_text(text, reply_markup=keyboard)
 
@@ -705,6 +735,10 @@ def setup_bot(
             await callback.answer("Нужен API ключ: /setkey API_КЛЮЧ", show_alert=True)
             return
 
+        if _check_too_soon(callback.from_user.id):
+            await callback.answer("Слишком часто, подожди пару секунд.")
+            return
+
         await callback.answer("Проверяю...")
 
         profile = await steam_client.get_player_summaries(api_key, target.steam_id)
@@ -719,7 +753,9 @@ def setup_bot(
         ]
         if profile.game_name:
             lines.append(f"Играет: {profile.game_name}")
-        if profile.last_logoff:
+        # last_logoff is the last LOGOFF time — only meaningful when the player
+        # is currently offline. Showing it for an online player is misleading.
+        if profile.persona_state == 0 and profile.last_logoff:
             lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
         await _append_cs2_activity(lines, target.steam_id)
 
@@ -740,6 +776,10 @@ def setup_bot(
             await callback.answer("Нужен API ключ: /setkey API_КЛЮЧ", show_alert=True)
             return
 
+        if _check_too_soon(callback.from_user.id):
+            await callback.answer("Слишком часто, подожди пару секунд.")
+            return
+
         await callback.answer("Проверяю...")
 
         profile = await steam_client.get_player_summaries(api_key, target.steam_id)
@@ -754,7 +794,9 @@ def setup_bot(
         ]
         if profile.game_name:
             lines.append(f"Играет: {profile.game_name}")
-        if profile.last_logoff:
+        # last_logoff is the last LOGOFF time — only meaningful when the player
+        # is currently offline. Showing it for an online player is misleading.
+        if profile.persona_state == 0 and profile.last_logoff:
             lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
         await _append_cs2_activity(lines, target.steam_id)
 
@@ -867,7 +909,7 @@ def setup_bot(
                 now = int(datetime.now(tz=timezone.utc).timestamp())
                 elapsed = now - state.game_start_time
                 if elapsed > 0:
-                    lines.append(f"Длительность сессии: {_format_duration(elapsed)}")
+                    lines.append(f"Длительность сессии: {format_duration_seconds(elapsed)}")
 
             # Show last logoff if available for context
             if state.last_logoff:
@@ -1064,20 +1106,15 @@ def setup_bot(
             return
 
         state = await db.get_target_state(db_conn, target.id)
-        status = "Пауза"
-        if target.active:
-            if state:
-                status = state_name(state.persona_state)
-                if state.game_name:
-                    status += f", играет: {state.game_name}"
-            else:
-                status = "Ещё не проверен"
-        marker = "активен" if target.active else "пауза"
-        text = f"{target.name} [{marker}]: {status}"
+        text = render_target_card(target, state)
         keyboard = _build_target_keyboard(target)
         await callback.message.edit_text(text, reply_markup=keyboard)
 
     dispatcher = Dispatcher()
+    # Optional allowlist enforcement (no-op when ALLOWED_TELEGRAM_IDS is empty).
+    allowlist = AllowlistMiddleware()
+    dispatcher.message.outer_middleware(allowlist)
+    dispatcher.callback_query.outer_middleware(allowlist)
     dispatcher.include_router(router)
     return dispatcher
 

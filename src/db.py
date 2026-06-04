@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 from typing import Optional, List
 
 import aiosqlite
@@ -10,7 +12,6 @@ logger = logging.getLogger(__name__)
 
 async def init_db(db: aiosqlite.Connection) -> None:
     """Initialize the database schema from schema.sql and add missing columns."""
-    import os
     schema_path = os.path.join(os.path.dirname(__file__), "..", "schema.sql")
     async with db.cursor() as cur:
         with open(schema_path, "r") as f:
@@ -84,6 +85,9 @@ async def add_target(db: aiosqlite.Connection, target: Target) -> Target:
     )
     target.id = cursor.lastrowid
     await db.commit()
+    # Ensure a default user_settings row exists so this user is eligible for
+    # daily summaries (which default to on) even if they never open settings.
+    await ensure_user_settings(db, target.telegram_id)
     return target
 
 
@@ -276,6 +280,20 @@ async def get_user_settings(db: aiosqlite.Connection, telegram_id: int) -> UserS
         )
 
 
+async def ensure_user_settings(db: aiosqlite.Connection, telegram_id: int) -> None:
+    """Ensure a user_settings row exists for this user, using schema defaults.
+
+    Uses INSERT OR IGNORE so existing rows (with user customisations) are
+    untouched. This guarantees default-on features like the daily summary
+    apply to users who never opened the settings menu.
+    """
+    await db.execute(
+        "INSERT OR IGNORE INTO user_settings (telegram_id) VALUES (?)",
+        (telegram_id,),
+    )
+    await db.commit()
+
+
 async def save_user_settings(db: aiosqlite.Connection, settings: UserSettings) -> None:
     """UPSERT user settings."""
     await db.execute(
@@ -309,14 +327,30 @@ async def save_user_settings(db: aiosqlite.Connection, settings: UserSettings) -
 async def get_users_due_summary(db: aiosqlite.Connection) -> List[tuple]:
     """Get users whose daily summary is due, evaluated in each user's timezone.
     Returns list of (telegram_id, daily_summary_time, timezone) tuples.
+
+    Users who have targets but no user_settings row are synthesised with
+    schema defaults (daily_summary_enabled on) so they receive summaries too.
     """
     from datetime import datetime, timezone as dt_timezone
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
     now_utc = datetime.now(tz=dt_timezone.utc)
+    # Union of users with a settings row (summary enabled) and users who own at
+    # least one target but have no settings row yet (treated as defaults-on).
+    # COALESCE supplies schema defaults for the no-row case.
     async with db.execute(
-        "SELECT telegram_id, daily_summary_time, timezone, last_summary_date "
-        "FROM user_settings WHERE daily_summary_enabled = 1"
+        "SELECT t.telegram_id, "
+        "COALESCE(us.daily_summary_time, '21:00'), "
+        "COALESCE(us.timezone, 'UTC'), "
+        "COALESCE(us.last_summary_date, '') "
+        "FROM (SELECT DISTINCT telegram_id FROM targets) AS t "
+        "LEFT JOIN user_settings AS us ON us.telegram_id = t.telegram_id "
+        "WHERE COALESCE(us.daily_summary_enabled, 1) = 1 "
+        "UNION "
+        "SELECT us.telegram_id, us.daily_summary_time, us.timezone, "
+        "COALESCE(us.last_summary_date, '') "
+        "FROM user_settings AS us "
+        "WHERE us.daily_summary_enabled = 1"
     ) as cur:
         rows = await cur.fetchall()
 
@@ -335,10 +369,15 @@ async def get_users_due_summary(db: aiosqlite.Connection) -> List[tuple]:
 
 
 async def mark_summary_sent(db: aiosqlite.Connection, telegram_id: int, date_str: str) -> None:
-    """Mark that a daily summary has been sent for a user on a given date."""
+    """Mark that a daily summary has been sent for a user on a given date.
+
+    Uses an UPSERT so it also works for users whose summary was synthesised
+    from defaults and who don't yet have a user_settings row.
+    """
     await db.execute(
-        "UPDATE user_settings SET last_summary_date = ? WHERE telegram_id = ?",
-        (date_str, telegram_id),
+        "INSERT INTO user_settings (telegram_id, last_summary_date) VALUES (?, ?) "
+        "ON CONFLICT(telegram_id) DO UPDATE SET last_summary_date = excluded.last_summary_date",
+        (telegram_id, date_str),
     )
     await db.commit()
 
@@ -399,7 +438,6 @@ async def save_activity(
 ) -> None:
     """Log a detected activity event. detected_at defaults to now."""
     if detected_at is None:
-        import time
         detected_at = int(time.time())
     await db.execute(
         "INSERT INTO activity_log "
@@ -420,7 +458,6 @@ async def save_activity_batch(
     """
     if not entries:
         return
-    import time
     now = int(time.time())
     rows = []
     for e in entries:
@@ -445,7 +482,6 @@ async def cleanup_activity_log(
     retention_days: int = 30,
 ) -> int:
     """Delete activity_log entries older than retention_days. Returns count deleted."""
-    import time
     cutoff = int(time.time()) - (retention_days * 86400)
     cursor = await db.execute(
         "DELETE FROM activity_log WHERE detected_at < ?", (cutoff,)

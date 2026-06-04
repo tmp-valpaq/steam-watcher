@@ -142,3 +142,91 @@ class TestGenerateAlertsMultiple:
         messages = [a.message for a in alerts]
         assert any("онлайн" in m for m in messages)
         assert any("CS2" in m for m in messages)
+
+
+def _event_type_of(alerts, substring):
+    """Return the event_type of the single alert whose message contains substring."""
+    matching = [a for a in alerts if substring in a.message]
+    assert len(matching) == 1, f"expected exactly one alert with {substring!r}"
+    return matching[0].event_type
+
+
+class TestGenerateAlertsEventType:
+    def test_first_check_event_type(self):
+        target = _make_target()
+        current = _make_state(persona_state=0)
+        alerts = generate_alerts(target, None, current, False)
+        assert alerts[0].event_type == "first_check"
+
+    def test_online_event_type(self):
+        target = _make_target()
+        previous = _make_state(persona_state=0)
+        current = _make_state(persona_state=1)
+        alerts = generate_alerts(target, previous, current, False)
+        assert _event_type_of(alerts, "зашёл онлайн") == "online"
+
+    def test_offline_event_type(self):
+        target = _make_target()
+        previous = _make_state(persona_state=1)
+        current = _make_state(persona_state=0, last_logoff=1705320000)
+        alerts = generate_alerts(target, previous, current, False)
+        assert _event_type_of(alerts, "вышел оффлайн") == "offline"
+
+    def test_game_start_event_type_and_metadata(self):
+        target = _make_target()
+        previous = _make_state(persona_state=1, game_name=None)
+        current = _make_state(persona_state=1, game_name="Dota 2")
+        alerts = generate_alerts(target, previous, current, False)
+        start = [a for a in alerts if "начал играть" in a.message][0]
+        assert start.event_type == "game_start"
+        assert start.game_name == "Dota 2"
+        assert start.is_dota is True
+
+    def test_game_start_non_dota_is_dota_false(self):
+        target = _make_target()
+        previous = _make_state(persona_state=1, game_name=None)
+        current = _make_state(persona_state=1, game_name="Counter-Strike 2")
+        alerts = generate_alerts(target, previous, current, False)
+        start = [a for a in alerts if "начал играть" in a.message][0]
+        assert start.event_type == "game_start"
+        assert start.is_dota is False
+
+    def test_game_stop_event_type(self):
+        target = _make_target()
+        previous = _make_state(persona_state=1, game_name="Dota 2")
+        current = _make_state(persona_state=1, game_name=None)
+        alerts = generate_alerts(target, previous, current, False)
+        stop = [a for a in alerts if "перестал играть" in a.message][0]
+        assert stop.event_type == "game_stop"
+        assert stop.game_name == "Dota 2"
+
+    def test_switch_game_event_types(self):
+        target = _make_target()
+        previous = _make_state(persona_state=1, game_name="Game A")
+        current = _make_state(persona_state=1, game_name="Game B")
+        alerts = generate_alerts(target, previous, current, False)
+        assert _event_type_of(alerts, "Game A") == "game_stop"
+        assert _event_type_of(alerts, "Game B") == "game_start"
+
+    def test_name_change_event_type(self):
+        target = _make_target()
+        previous = _make_state(persona_name="OldName")
+        current = _make_state(persona_name="NewName")
+        alerts = generate_alerts(target, previous, current, False)
+        assert _event_type_of(alerts, "сменил ник") == "name_change"
+
+    def test_invisible_event_type(self):
+        target = _make_target()
+        previous = _make_state(persona_state=0, playtime_forever=50)
+        current = _make_state(persona_state=0, playtime_forever=80)
+        alerts = generate_alerts(target, previous, current, True)
+        assert _event_type_of(alerts, "НЕВИДИМКА") == "invisible"
+
+    def test_nickname_containing_event_text_not_misclassified(self):
+        # Regression for ARCH#8: a nickname that literally contains "начал играть"
+        # must NOT cause the name-change alert to be routed as a game_start.
+        target = _make_target()
+        previous = _make_state(persona_name="old")
+        current = _make_state(persona_name="начал играть в Dota")
+        alerts = generate_alerts(target, previous, current, False)
+        assert _event_type_of(alerts, "сменил ник") == "name_change"

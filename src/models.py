@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -25,12 +25,14 @@ class TargetState:
     persona_name: str = ""
     game_id: Optional[str] = None
     game_name: Optional[str] = None
+    # Self-tracked total playtime, in SECONDS (sum of game_playtimes values).
     playtime_forever: int = 0
     last_logoff: Optional[int] = None
     last_checked: int = 0
     last_match_id: Optional[str] = None
     last_match_time: Optional[int] = None
-    # JSON: {appid_str: playtime_minutes_int, ...}
+    # JSON: {appid_str: playtime_seconds_int, ...} — self-tracked, accumulated
+    # from real elapsed wall-time per poll (NOT Steam's playtime_forever).
     game_playtimes: Optional[str] = None
     visibility_state: int = 3
     game_start_time: Optional[int] = None
@@ -42,6 +44,15 @@ class TargetState:
 class Alert:
     target: Target
     message: str
+    # Structured event classification so routing never has to substring-match
+    # the (user-facing, Russian) message text. One of:
+    #   "first_check", "invisible", "visibility_change", "online", "offline",
+    #   "game_start", "game_stop", "name_change", or None.
+    event_type: Optional[str] = None
+    # For game_start/game_stop/invisible alerts: the relevant game name.
+    game_name: Optional[str] = None
+    # True when the alert refers to Dota 2 (used to gate MMR enrichment).
+    is_dota: bool = False
 
 
 @dataclass
@@ -64,13 +75,6 @@ class MatchInfo:
     start_time: Optional[int] = None  # unix timestamp when available
     hero_name: Optional[str] = None  # for Dota
     source: str = "opendota"
-
-
-@dataclass
-class RecentGames:
-    steam_id: str
-    games: list = field(default_factory=list)
-    # list of {"appid": int, "name": str, "playtime_forever": int}
 
 
 @dataclass

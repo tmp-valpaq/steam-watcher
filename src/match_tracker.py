@@ -48,6 +48,16 @@ _RELATIVE_TIME_RE = re.compile(
     r"(?P<unit>second|minute|hour|day|week|month|year)s?\s+ago",
     re.IGNORECASE,
 )
+# Negative ("no matches found") verdicts must outlive a full match-poll cycle,
+# otherwise non-Dota / Cloudflare-gated targets get re-fetched (and re-browsed)
+# on every sweep. The watcher polls matches every 300s, so cache empties for at
+# least that long regardless of the (much shorter) base empty-cache TTL knob.
+_MATCH_POLL_INTERVAL_SEC = 300
+_NEGATIVE_CACHE_TTL_SEC = max(DOTABUFF_EMPTY_CACHE_TTL_SEC, _MATCH_POLL_INTERVAL_SEC)
+# Upper bound on headless-browser launches per poll cycle, so a sweep of many
+# offline non-Dota targets cannot fan out into many Chromium contexts at once.
+_BROWSER_LAUNCH_BUDGET_PER_CYCLE = 2
+
 _MATCH_LINK_RE = re.compile(r"/matches/(\d+)")
 _HERO_SLUG_RE = re.compile(r"/heroes/([a-z0-9\-]+)")
 _UNIX_TS_RE = re.compile(r'(?:data-(?:timestamp|time|unix)|timestamp)="(\d{10,13})"')
@@ -66,6 +76,11 @@ class MatchTracker:
         self._last_request_time: float = 0.0
         self._min_interval: float = 1.0  # 1 req/sec for OpenDota free tier
         self._dotabuff_browser_enabled: bool = DOTABUFF_BROWSER_ENABLED
+        # Per-cycle browser-launch budget. Replenished whenever a full match-poll
+        # interval has elapsed since the window opened, so a single sweep of many
+        # offline non-Dota targets can launch at most a handful of browsers.
+        self._browser_budget: int = _BROWSER_LAUNCH_BUDGET_PER_CYCLE
+        self._browser_budget_window_start: float = 0.0
 
     async def _rate_limit(self) -> None:
         """Ensure we don't exceed 1 request per second to OpenDota."""
@@ -377,8 +392,30 @@ class MatchTracker:
                 break
         return matches
 
+    def _try_acquire_browser_budget(self) -> bool:
+        """Consume one headless-browser launch from the per-cycle budget.
+
+        Returns True if a launch is allowed. The budget refills once a full
+        match-poll interval has elapsed, bounding the number of Chromium
+        contexts a single sweep of offline non-Dota targets can spin up.
+        """
+        now = time.time()
+        if now - self._browser_budget_window_start >= _MATCH_POLL_INTERVAL_SEC:
+            self._browser_budget_window_start = now
+            self._browser_budget = _BROWSER_LAUNCH_BUDGET_PER_CYCLE
+        if self._browser_budget <= 0:
+            return False
+        self._browser_budget -= 1
+        return True
+
     async def _get_recent_matches_dotabuff_browser(self, steam_id: str, limit: int) -> List[MatchInfo]:
         if not self._dotabuff_browser_enabled or DotabuffBrowserClient is None:
+            return []
+        if not self._try_acquire_browser_budget():
+            logger.info(
+                "Dotabuff browser budget exhausted this cycle; skipping browser fetch for %s",
+                steam_id,
+            )
             return []
         browser_client_cls = DotabuffBrowserClient
 
@@ -446,21 +483,21 @@ class MatchTracker:
         if status != 200:
             logger.info("Dotabuff returned %s for %s", status, steam_id)
             matches = await self._get_recent_matches_dotabuff_browser(steam_id, fetch_limit)
-            ttl = DOTABUFF_CACHE_TTL_SEC if matches else DOTABUFF_EMPTY_CACHE_TTL_SEC
+            ttl = DOTABUFF_CACHE_TTL_SEC if matches else _NEGATIVE_CACHE_TTL_SEC
             self._dotabuff_cache[steam_id] = (now + ttl, matches)
             return matches[:limit]
 
         if "LATEST MATCHES" not in html or "Just a moment" in html:
             logger.info("Dotabuff page for %s did not expose match rows", steam_id)
             matches = await self._get_recent_matches_dotabuff_browser(steam_id, fetch_limit)
-            ttl = DOTABUFF_CACHE_TTL_SEC if matches else DOTABUFF_EMPTY_CACHE_TTL_SEC
+            ttl = DOTABUFF_CACHE_TTL_SEC if matches else _NEGATIVE_CACHE_TTL_SEC
             self._dotabuff_cache[steam_id] = (now + ttl, matches)
             return matches[:limit]
 
         matches = self._parse_dotabuff_matches(html, steam_id, limit=fetch_limit)
         if not matches:
             matches = await self._get_recent_matches_dotabuff_browser(steam_id, fetch_limit)
-        ttl = DOTABUFF_CACHE_TTL_SEC if matches else DOTABUFF_EMPTY_CACHE_TTL_SEC
+        ttl = DOTABUFF_CACHE_TTL_SEC if matches else _NEGATIVE_CACHE_TTL_SEC
         self._dotabuff_cache[steam_id] = (now + ttl, matches)
         if matches:
             logger.info(

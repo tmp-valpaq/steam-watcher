@@ -1,7 +1,33 @@
 import os
 
+
+def _parse_id_set(raw: str) -> set:
+    """Parse a comma-separated list of Telegram IDs into a set[int].
+
+    Ignores blanks and non-integer entries. Empty/whitespace input → empty set.
+    """
+    ids = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            ids.add(int(part))
+        except ValueError:
+            continue
+    return ids
+
+
 STEAM_BOT_TOKEN = os.environ.get("STEAM_BOT_TOKEN", "")
 DEFAULT_STEAM_API_KEY = os.environ.get("DEFAULT_STEAM_API_KEY", "")
+
+# Optional allowlist of Telegram user IDs (comma-separated). Empty set = open to
+# everyone (current default behavior); when non-empty, only listed IDs may use the bot.
+ALLOWED_TELEGRAM_IDS = _parse_id_set(os.environ.get("ALLOWED_TELEGRAM_IDS", ""))
+
+# Minimum seconds between expensive Steam-hitting actions (/check, check buttons,
+# add) per user. Anti-flood guard so one user can't stall global polling.
+CHECK_MIN_INTERVAL_SEC = int(os.environ.get("CHECK_MIN_INTERVAL_SEC", "3"))
 
 DOTABUFF_BROWSER_ENABLED = os.environ.get("DOTABUFF_BROWSER_ENABLED", "0") == "1"
 DOTABUFF_BROWSER_PROFILE_DIR = os.environ.get(
