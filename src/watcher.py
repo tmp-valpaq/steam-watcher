@@ -121,10 +121,12 @@ def generate_alerts(
                 if others:
                     alert_msg += "\nТакже: " + ", ".join(others)
         else:
+            current_min = max(1, current_state.playtime_forever // 60)
+            previous_min = max(0, previous_state.playtime_forever // 60)
             alert_msg = (
                 f"👻 {name}: НЕВИДИМКА! Статус offline, "
-                f"но наиграно {current_state.playtime_forever} мин "
-                f"(было {previous_state.playtime_forever})"
+                f"но наиграно {current_min} мин "
+                f"(было {previous_min})"
             )
         alerts.append(Alert(
             target=target,
@@ -243,6 +245,7 @@ class Watcher:
         self._recent_matches_cache: Dict[str, list] = {}  # steam_id -> list[MatchInfo]
         self._recent_matches_cache_ttl: float = 0.0
         self._last_cleanup_date: str = ""
+        self._blocked_user_ids: set[int] = set()
         # appid (str) -> game name; seeded with hardcoded fallbacks, enriched from Steam profile responses
         self._game_name_cache: Dict[str, str] = dict(APPID_NAMES)
 
@@ -325,6 +328,7 @@ class Watcher:
         """Poll all active targets that are due for a check using batch API."""
         targets = await db.get_active_targets(self._db)
         now = int(time.time())
+        self._blocked_user_ids.clear()
 
         # Group by user (API key)
         user_targets: Dict[int, List[Target]] = {}
@@ -346,6 +350,8 @@ class Watcher:
             # Filter targets that are due for a check
             due_targets: List[Target] = []
             for target in user_target_list:
+                if target.telegram_id in self._blocked_user_ids:
+                    continue
                 state = await db.get_target_state(self._db, target.id)
                 if state and (now - state.last_checked) < target.interval_seconds:
                     continue
@@ -360,6 +366,8 @@ class Watcher:
 
             # Process each due target
             for target in due_targets:
+                if target.telegram_id in self._blocked_user_ids:
+                    continue
                 profile = profiles.get(target.steam_id)
                 if profile is None:
                     logger.warning("Could not fetch profile for target %s", target.name)
@@ -710,35 +718,45 @@ class Watcher:
                 lines.append("")
                 lines.append(f"Всего: {format_playtime_minutes(total // 60)}")
 
-                await self._send_alert(telegram_id, "\n".join(lines))
+                try:
+                    await self._send_alert(telegram_id, "\n".join(lines))
+                except TelegramForbiddenError:
+                    logger.info(
+                        "Bot blocked by %s during daily summary; deactivating all targets",
+                        telegram_id,
+                    )
+                    await self._deactivate_blocked_user(telegram_id)
                 await db.mark_summary_sent(self._db, telegram_id, today_str)
 
             except Exception as e:
                 logger.error("Failed to send daily summary for %s: %s", telegram_id, e)
 
+    async def _deactivate_blocked_user(self, telegram_id: int) -> None:
+        try:
+            changed = await db.set_all_targets_active(self._db, telegram_id, False)
+            self._blocked_user_ids.add(telegram_id)
+            logger.info("Deactivated %s targets for blocked user %s", changed, telegram_id)
+        except Exception as e:
+            logger.error("Failed to deactivate blocked user %s: %s", telegram_id, e)
+
     async def _send_to_target(self, target: Target, message: str) -> bool:
         """Send a message tied to a specific target.
 
         On a regular send failure we log and return False. If the user has
-        blocked the bot (TelegramForbiddenError), polling that target is
-        pointless forever, so we deactivate it and return False.
+        blocked the bot (TelegramForbiddenError), polling all targets for that
+        Telegram user is pointless forever, so deactivate the entire user slice.
         """
         try:
             await self._send_alert(target.telegram_id, message)
             return True
         except TelegramForbiddenError:
             logger.info(
-                "Bot blocked by %s; deactivating target %s",
+                "Bot blocked by %s; deactivating all targets for user after target %s",
                 target.telegram_id,
                 target.name,
             )
-            try:
-                await db.set_target_active(
-                    self._db, target.telegram_id, target.steam_id, False
-                )
-                target.active = False
-            except Exception as e:
-                logger.error("Failed to deactivate blocked target %s: %s", target.name, e)
+            await self._deactivate_blocked_user(target.telegram_id)
+            target.active = False
             return False
         except Exception as e:
             logger.error("Failed to send alert: %s", e)

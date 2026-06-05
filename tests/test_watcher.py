@@ -108,8 +108,8 @@ class TestGenerateAlertsGameChange:
 class TestGenerateAlertsInvisible:
     def test_invisible_detected(self):
         target = _make_target()
-        previous = _make_state(persona_state=0, playtime_forever=50)
-        current = _make_state(persona_state=0, playtime_forever=80)
+        previous = _make_state(persona_state=0, playtime_forever=50 * 60)
+        current = _make_state(persona_state=0, playtime_forever=80 * 60)
         alerts = generate_alerts(target, previous, current, True)
         messages = [a.message for a in alerts]
         assert any("НЕВИДИМКА" in m for m in messages)
@@ -240,7 +240,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.methods import SendMessage
 
 from src import db
-from src.models import User
+from src.models import User, UserSettings
 from src.watcher import Watcher
 
 
@@ -311,15 +311,23 @@ class TestEnrichDotaAlert:
 
 @pytest.mark.asyncio
 class TestBlockedBotDeactivates:
-    async def test_forbidden_error_deactivates_target(self, db_conn):
+    async def test_forbidden_error_deactivates_all_targets_for_user(self, db_conn):
         telegram_id = 999
-        steam_id = "76561198000000777"
+        steam_id_a = "76561198000000777"
+        steam_id_b = "76561198000000888"
         await db.save_user(db_conn, User(telegram_id=telegram_id, steam_api_key="k"))
         target = await db.add_target(
             db_conn,
             Target(
-                id=0, telegram_id=telegram_id, steam_id=steam_id,
+                id=0, telegram_id=telegram_id, steam_id=steam_id_a,
                 name="Blocked", interval_seconds=30, active=True,
+            ),
+        )
+        await db.add_target(
+            db_conn,
+            Target(
+                id=0, telegram_id=telegram_id, steam_id=steam_id_b,
+                name="BlockedToo", interval_seconds=30, active=True,
             ),
         )
 
@@ -330,12 +338,105 @@ class TestBlockedBotDeactivates:
 
         ok = await watcher._send_to_target(target, "hello")
         assert ok is False
-        # In-memory target object reflects deactivation.
         assert target.active is False
 
-        # DB reflects deactivation: target no longer active.
         active = await db.get_active_targets(db_conn)
-        assert all(t.steam_id != steam_id for t in active)
+        assert all(t.telegram_id != telegram_id for t in active)
         stored = await db.get_targets(db_conn, telegram_id)
-        assert len(stored) == 1
-        assert stored[0].active is False
+        assert len(stored) == 2
+        assert all(t.active is False for t in stored)
+
+    async def test_daily_summary_marks_user_sent_when_bot_blocked(self, db_conn, monkeypatch):
+        import datetime as _dtmod
+
+        telegram_id = 1234
+        await db.save_user(db_conn, User(telegram_id=telegram_id, steam_api_key="k"))
+        target = await db.add_target(
+            db_conn,
+            Target(
+                id=0, telegram_id=telegram_id, steam_id="76561198000000444",
+                name="SummaryBlocked", interval_seconds=30, active=True,
+            ),
+        )
+        await db.save_target_state(
+            db_conn,
+            TargetState(
+                target_id=target.id,
+                persona_state=0,
+                persona_name="SummaryBlocked",
+                playtime_forever=3600,
+                last_checked=int(_dtmod.datetime(2026, 6, 4, 10, 0, tzinfo=_dtmod.timezone.utc).timestamp()),
+                game_playtimes='{"730": 3600}',
+                daily_playtime_snapshot='{"730": 0}',
+                playtime_unit_version=2,
+            ),
+        )
+        await db.save_user_settings(
+            db_conn,
+            UserSettings(
+                telegram_id=telegram_id,
+                daily_summary_enabled=True,
+                daily_summary_time="00:00",
+                last_summary_date="",
+                timezone="UTC",
+            ),
+        )
+
+        fixed = _dtmod.datetime(2026, 6, 4, 23, 30, tzinfo=_dtmod.timezone.utc)
+
+        class _FixedDateTime(_dtmod.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed.astimezone(tz) if tz else fixed.replace(tzinfo=None)
+
+        monkeypatch.setattr("src.db.datetime", _FixedDateTime)
+        monkeypatch.setattr("src.watcher.datetime", _FixedDateTime)
+
+        async def _raise(telegram_id, message):
+            raise _forbidden_error()
+
+        watcher = _make_watcher(db_conn, _raise)
+        await watcher._send_daily_summaries()
+
+        settings = await db.get_user_settings(db_conn, telegram_id)
+        assert settings.last_summary_date == "2026-06-04"
+        stored = await db.get_targets(db_conn, telegram_id)
+        assert all(t.active is False for t in stored)
+
+    async def test_poll_all_skips_remaining_targets_for_user_after_block(self, db_conn):
+        telegram_id = 777
+        await db.save_user(db_conn, User(telegram_id=telegram_id, steam_api_key="k"))
+        target_a = await db.add_target(
+            db_conn,
+            Target(id=0, telegram_id=telegram_id, steam_id="76561198000000111", name="A", interval_seconds=30, active=True),
+        )
+        target_b = await db.add_target(
+            db_conn,
+            Target(id=0, telegram_id=telegram_id, steam_id="76561198000000222", name="B", interval_seconds=30, active=True),
+        )
+
+        async def _send_ok(telegram_id, message):
+            return None
+
+        watcher = _make_watcher(db_conn, _send_ok)
+        watcher._steam.get_player_summaries_batch = AsyncMock(
+            return_value={
+                target_a.steam_id: object(),
+                target_b.steam_id: object(),
+            }
+        )
+
+        seen = []
+
+        async def _fake_check_target(api_key, target, profile=None):
+            seen.append(target.steam_id)
+            if target.steam_id == target_a.steam_id:
+                await watcher._deactivate_blocked_user(telegram_id)
+
+        watcher._check_target = AsyncMock(side_effect=_fake_check_target)
+
+        await watcher._poll_all()
+
+        assert seen == [target_a.steam_id]
+        stored = await db.get_targets(db_conn, telegram_id)
+        assert all(t.active is False for t in stored)

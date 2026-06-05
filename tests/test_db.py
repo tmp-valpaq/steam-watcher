@@ -3,6 +3,7 @@
 import pytest
 import pytest_asyncio
 from src.db import (
+    init_db,
     save_user,
     get_user,
     add_target,
@@ -10,6 +11,7 @@ from src.db import (
     get_targets,
     get_active_targets,
     set_target_active,
+    set_all_targets_active,
     get_target_state,
     save_target_state,
 )
@@ -126,6 +128,18 @@ class TestTargetCRUD:
         targets = await get_targets(db_conn, 111)
         assert targets[0].active is True
 
+    async def test_set_all_targets_active_for_user(self, db_conn):
+        await save_user(db_conn, User(telegram_id=111, steam_api_key="key"))
+        await add_target(db_conn, Target(id=0, telegram_id=111, steam_id="111", name="A"))
+        await add_target(db_conn, Target(id=0, telegram_id=111, steam_id="222", name="B"))
+
+        changed = await set_all_targets_active(db_conn, 111, False)
+        assert changed == 2
+
+        targets = await get_targets(db_conn, 111)
+        assert len(targets) == 2
+        assert all(t.active is False for t in targets)
+
 
 @pytest.mark.asyncio
 class TestTargetStateCRUD:
@@ -173,6 +187,184 @@ class TestTargetStateCRUD:
     async def test_get_nonexistent_state(self, db_conn):
         fetched = await get_target_state(db_conn, 99999)
         assert fetched is None
+
+
+@pytest.mark.asyncio
+class TestLegacyPlaytimeMigration:
+    async def test_get_target_state_normalizes_legacy_minute_based_rows_safely(self, tmp_path):
+        import aiosqlite
+        import json
+
+        db_path = tmp_path / "legacy.db"
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.executescript(
+                """
+                CREATE TABLE users (
+                    telegram_id INTEGER PRIMARY KEY,
+                    steam_api_key TEXT NOT NULL
+                );
+                CREATE TABLE targets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL,
+                    steam_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    interval_seconds INTEGER NOT NULL DEFAULT 30,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(telegram_id, steam_id)
+                );
+                CREATE TABLE target_states (
+                    target_id INTEGER PRIMARY KEY,
+                    persona_state INTEGER,
+                    persona_name TEXT,
+                    game_id TEXT,
+                    game_name TEXT,
+                    playtime_forever INTEGER,
+                    last_logoff INTEGER,
+                    last_checked INTEGER,
+                    last_match_id TEXT,
+                    last_match_time INTEGER,
+                    game_playtimes TEXT,
+                    visibility_state INTEGER,
+                    game_start_time INTEGER,
+                    last_session_update INTEGER,
+                    daily_playtime_snapshot TEXT,
+                    FOREIGN KEY (target_id) REFERENCES targets(id)
+                );
+                """
+            )
+            await conn.execute(
+                "INSERT INTO users (telegram_id, steam_api_key) VALUES (?, ?)",
+                (111, "key"),
+            )
+            await conn.execute(
+                "INSERT INTO targets (id, telegram_id, steam_id, name, interval_seconds, active) VALUES (?, ?, ?, ?, ?, ?)",
+                (1, 111, "76561198000000001", "Legacy", 30, 1),
+            )
+            await conn.execute(
+                "INSERT INTO target_states (target_id, persona_state, persona_name, game_id, game_name, playtime_forever, last_logoff, last_checked, game_playtimes, visibility_state, daily_playtime_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    1,
+                    1,
+                    "Legacy",
+                    "730",
+                    "Counter-Strike 2",
+                    42,
+                    None,
+                    1705320000,
+                    json.dumps({"730": 30, "570": 12}),
+                    3,
+                    json.dumps({"730": 10, "570": 2}),
+                ),
+            )
+            await conn.commit()
+
+        async with aiosqlite.connect(db_path) as conn:
+            await init_db(conn)
+
+            async with conn.execute(
+                "SELECT playtime_forever, game_playtimes, daily_playtime_snapshot, playtime_unit_version FROM target_states WHERE target_id = 1"
+            ) as cur:
+                raw = await cur.fetchone()
+            assert raw == (
+                42,
+                json.dumps({"730": 30, "570": 12}),
+                json.dumps({"730": 10, "570": 2}),
+                None,
+            )
+
+            state = await get_target_state(conn, 1)
+            assert state is not None
+            assert state.playtime_forever == 42 * 60
+            assert state.playtime_unit_version == 2
+            assert json.loads(state.game_playtimes) == {"730": 30 * 60, "570": 12 * 60}
+            assert json.loads(state.daily_playtime_snapshot) == {"730": 10 * 60, "570": 2 * 60}
+
+            await save_target_state(conn, state)
+            async with conn.execute(
+                "SELECT playtime_forever, game_playtimes, daily_playtime_snapshot, playtime_unit_version FROM target_states WHERE target_id = 1"
+            ) as cur:
+                persisted = await cur.fetchone()
+            assert persisted == (
+                42 * 60,
+                json.dumps({"730": 30 * 60, "570": 12 * 60}),
+                json.dumps({"730": 10 * 60, "570": 2 * 60}),
+                2,
+            )
+
+    async def test_malformed_legacy_playtime_map_stays_unmigrated(self, tmp_path):
+        import aiosqlite
+        import json
+
+        db_path = tmp_path / "legacy-malformed.db"
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.executescript(
+                """
+                CREATE TABLE users (
+                    telegram_id INTEGER PRIMARY KEY,
+                    steam_api_key TEXT NOT NULL
+                );
+                CREATE TABLE targets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL,
+                    steam_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    interval_seconds INTEGER NOT NULL DEFAULT 30,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(telegram_id, steam_id)
+                );
+                CREATE TABLE target_states (
+                    target_id INTEGER PRIMARY KEY,
+                    persona_state INTEGER,
+                    persona_name TEXT,
+                    game_id TEXT,
+                    game_name TEXT,
+                    playtime_forever INTEGER,
+                    last_logoff INTEGER,
+                    last_checked INTEGER,
+                    last_match_id TEXT,
+                    last_match_time INTEGER,
+                    game_playtimes TEXT,
+                    visibility_state INTEGER,
+                    game_start_time INTEGER,
+                    last_session_update INTEGER,
+                    daily_playtime_snapshot TEXT,
+                    FOREIGN KEY (target_id) REFERENCES targets(id)
+                );
+                """
+            )
+            await conn.execute("INSERT INTO users (telegram_id, steam_api_key) VALUES (?, ?)", (111, "key"))
+            await conn.execute(
+                "INSERT INTO targets (id, telegram_id, steam_id, name, interval_seconds, active) VALUES (?, ?, ?, ?, ?, ?)",
+                (1, 111, "76561198000000001", "Legacy", 30, 1),
+            )
+            await conn.execute(
+                "INSERT INTO target_states (target_id, persona_state, persona_name, game_id, game_name, playtime_forever, last_logoff, last_checked, game_playtimes, visibility_state, daily_playtime_snapshot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    1,
+                    1,
+                    "Legacy",
+                    "730",
+                    "Counter-Strike 2",
+                    42,
+                    None,
+                    1705320000,
+                    json.dumps({"730": 30, "570": None}),
+                    3,
+                    json.dumps({"730": 10, "570": 2}),
+                ),
+            )
+            await conn.commit()
+
+        async with aiosqlite.connect(db_path) as conn:
+            await init_db(conn)
+            state = await get_target_state(conn, 1)
+            assert state is not None
+            assert state.playtime_forever == 42
+            assert state.playtime_unit_version == 1
+            assert state.game_playtimes is not None
+            assert state.daily_playtime_snapshot is not None
+            assert json.loads(state.game_playtimes) == {"730": 30, "570": None}
+            assert json.loads(state.daily_playtime_snapshot) == {"730": 10, "570": 2}
 
 
 @pytest.mark.asyncio

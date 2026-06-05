@@ -1,6 +1,9 @@
+import datetime
+import json
 import logging
 import os
 import time
+from datetime import timezone as _stdlib_timezone
 from typing import Optional, List
 
 import aiosqlite
@@ -28,7 +31,9 @@ async def init_db(db: aiosqlite.Connection) -> None:
         with open(schema_path, "r") as f:
             await cur.executescript(f.read())
 
-    # Migrate: add columns that may be missing from older DBs
+    # Migrate: add columns that may be missing from older DBs.
+    # playtime_unit_version is handled separately: on existing DBs we add it as a
+    # nullable column so legacy/versionless rows are not silently stamped as v2.
     _TARGET_STATE_COLUMNS = [
         ("last_match_id", "TEXT"),
         ("last_match_time", "INTEGER"),
@@ -47,6 +52,10 @@ async def init_db(db: aiosqlite.Connection) -> None:
                 await cur.execute(
                     f"ALTER TABLE target_states ADD COLUMN {col_name} {col_type}"
                 )
+        if "playtime_unit_version" not in existing:
+            await cur.execute(
+                "ALTER TABLE target_states ADD COLUMN playtime_unit_version INTEGER"
+            )
 
         # Migrate user_settings: add timezone column if missing
         await cur.execute("PRAGMA table_info(user_settings)")
@@ -56,6 +65,60 @@ async def init_db(db: aiosqlite.Connection) -> None:
                 "ALTER TABLE user_settings ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'"
             )
     await db.commit()
+
+
+def _loads_playtime_map(raw: Optional[str]) -> Optional[dict]:
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    converted = {}
+    for key, value in data.items():
+        try:
+            converted[str(key)] = int(value)
+        except (TypeError, ValueError):
+            return None
+    return converted
+
+
+def _dumps_playtime_map(data: Optional[dict], fallback_raw: Optional[str]) -> Optional[str]:
+    if data is None:
+        return fallback_raw
+    return json.dumps(data)
+
+
+def _normalize_legacy_playtime_payload(
+    playtime_forever: Optional[int],
+    game_playtimes: Optional[str],
+    daily_snapshot: Optional[str],
+    playtime_unit_version: Optional[int],
+) -> tuple[int, Optional[str], Optional[str], int]:
+    version = playtime_unit_version if playtime_unit_version is not None else 1
+    normalized_playtime = playtime_forever or 0
+    if version >= 2:
+        return normalized_playtime, game_playtimes, daily_snapshot, version
+
+    current_pts = _loads_playtime_map(game_playtimes)
+    snapshot_pts = _loads_playtime_map(daily_snapshot)
+    if (game_playtimes and current_pts is None) or (daily_snapshot and snapshot_pts is None):
+        # Refuse partial/ambiguous migration. Keep the row legacy-marked so a
+        # later explicit cleanup can fix the malformed payload without data loss.
+        return normalized_playtime, game_playtimes, daily_snapshot, version
+
+    normalized_playtime *= 60
+    normalized_game_pts = _dumps_playtime_map(
+        {appid: secs * 60 for appid, secs in current_pts.items()} if current_pts is not None else None,
+        game_playtimes,
+    )
+    normalized_snapshot = _dumps_playtime_map(
+        {appid: secs * 60 for appid, secs in snapshot_pts.items()} if snapshot_pts is not None else None,
+        daily_snapshot,
+    )
+    return normalized_playtime, normalized_game_pts, normalized_snapshot, 2
 
 
 # ── User CRUD ──────────────────────────────────────────────────────────
@@ -192,6 +255,17 @@ async def set_target_active(
     return cursor.rowcount > 0
 
 
+async def set_all_targets_active(
+    db: aiosqlite.Connection, telegram_id: int, active: bool
+) -> int:
+    cursor = await db.execute(
+        "UPDATE targets SET active = ? WHERE telegram_id = ?",
+        (1 if active else 0, telegram_id),
+    )
+    await db.commit()
+    return cursor.rowcount
+
+
 async def rename_target(
     db: aiosqlite.Connection, telegram_id: int, steam_id: str, new_name: str
 ) -> bool:
@@ -210,29 +284,33 @@ async def get_target_state(db: aiosqlite.Connection, target_id: int) -> Optional
         "SELECT target_id, persona_state, persona_name, game_id, game_name, "
         "playtime_forever, last_logoff, last_checked, last_match_id, last_match_time, "
         "game_playtimes, visibility_state, game_start_time, last_session_update, "
-        "daily_playtime_snapshot "
+        "daily_playtime_snapshot, playtime_unit_version "
         "FROM target_states WHERE target_id = ?",
         (target_id,),
     ) as cur:
         row = await cur.fetchone()
         if row is None:
             return None
+        playtime_forever, game_playtimes, daily_snapshot, version = _normalize_legacy_playtime_payload(
+            row[5], row[10], row[14], row[15]
+        )
         return TargetState(
             target_id=row[0],
             persona_state=row[1],
             persona_name=row[2],
             game_id=row[3],
             game_name=row[4],
-            playtime_forever=row[5],
+            playtime_forever=playtime_forever,
             last_logoff=row[6],
             last_checked=row[7],
             last_match_id=row[8],
             last_match_time=row[9],
-            game_playtimes=row[10],
+            game_playtimes=game_playtimes,
             visibility_state=row[11] if row[11] is not None else 3,
             game_start_time=row[12],
             last_session_update=row[13],
-            daily_playtime_snapshot=row[14],
+            daily_playtime_snapshot=daily_snapshot,
+            playtime_unit_version=version,
         )
 
 
@@ -242,8 +320,8 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
         "(target_id, persona_state, persona_name, game_id, game_name, "
         "playtime_forever, last_logoff, last_checked, last_match_id, last_match_time, "
         "game_playtimes, visibility_state, game_start_time, last_session_update, "
-        "daily_playtime_snapshot) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "daily_playtime_snapshot, playtime_unit_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(target_id) DO UPDATE SET "
         "persona_state = excluded.persona_state, "
         "persona_name = excluded.persona_name, "
@@ -258,7 +336,8 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
         "visibility_state = excluded.visibility_state, "
         "game_start_time = excluded.game_start_time, "
         "last_session_update = excluded.last_session_update, "
-        "daily_playtime_snapshot = excluded.daily_playtime_snapshot",
+        "daily_playtime_snapshot = excluded.daily_playtime_snapshot, "
+        "playtime_unit_version = excluded.playtime_unit_version",
         (
             state.target_id,
             state.persona_state,
@@ -275,6 +354,7 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
             state.game_start_time,
             state.last_session_update,
             state.daily_playtime_snapshot,
+            state.playtime_unit_version,
         ),
     )
     await db.commit()
@@ -357,10 +437,10 @@ async def get_users_due_summary(db: aiosqlite.Connection) -> List[tuple]:
     Users who have targets but no user_settings row are synthesised with
     schema defaults (daily_summary_enabled on) so they receive summaries too.
     """
-    from datetime import datetime, timezone as dt_timezone
     from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-    now_utc = datetime.now(tz=dt_timezone.utc)
+    dt_cls = datetime.datetime if hasattr(datetime, "datetime") else datetime
+    now_utc = dt_cls.now(tz=_stdlib_timezone.utc)
     # Union of users with a settings row (summary enabled) and users who own at
     # least one target but have no settings row yet (treated as defaults-on).
     # COALESCE supplies schema defaults for the no-row case.

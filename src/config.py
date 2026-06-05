@@ -18,6 +18,20 @@ def _parse_id_set(raw: str) -> set:
     return ids
 
 
+def _int_env(name: str, default: int) -> int:
+    """Best-effort int env parsing with safe fallback.
+
+    A bad env var should not crash the bot at import/startup time.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return default
+
+
 STEAM_BOT_TOKEN = os.environ.get("STEAM_BOT_TOKEN", "")
 DEFAULT_STEAM_API_KEY = os.environ.get("DEFAULT_STEAM_API_KEY", "")
 
@@ -27,7 +41,7 @@ ALLOWED_TELEGRAM_IDS = _parse_id_set(os.environ.get("ALLOWED_TELEGRAM_IDS", ""))
 
 # Minimum seconds between expensive Steam-hitting actions (/check, check buttons,
 # add) per user. Anti-flood guard so one user can't stall global polling.
-CHECK_MIN_INTERVAL_SEC = int(os.environ.get("CHECK_MIN_INTERVAL_SEC", "3"))
+CHECK_MIN_INTERVAL_SEC = _int_env("CHECK_MIN_INTERVAL_SEC", 3)
 
 DOTABUFF_BROWSER_ENABLED = os.environ.get("DOTABUFF_BROWSER_ENABLED", "0") == "1"
 DOTABUFF_BROWSER_PROFILE_DIR = os.environ.get(
@@ -38,16 +52,12 @@ DOTABUFF_BROWSER_OUTPUT_DIR = os.environ.get(
     "DOTABUFF_BROWSER_OUTPUT_DIR",
     os.path.join(os.path.dirname(__file__), "..", ".cache", "dotabuff-playwright-output"),
 )
-DOTABUFF_BROWSER_TIMEOUT_MS = int(os.environ.get("DOTABUFF_BROWSER_TIMEOUT_MS", "45000"))
-DOTABUFF_BROWSER_WAIT_MS = int(os.environ.get("DOTABUFF_BROWSER_WAIT_MS", "3000"))
-DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS = int(
-    os.environ.get("DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS", "25000")
-)
-DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS = int(
-    os.environ.get("DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS", "15000")
-)
-DOTABUFF_CACHE_TTL_SEC = int(os.environ.get("DOTABUFF_CACHE_TTL_SEC", "120"))
-DOTABUFF_EMPTY_CACHE_TTL_SEC = int(os.environ.get("DOTABUFF_EMPTY_CACHE_TTL_SEC", "30"))
+DOTABUFF_BROWSER_TIMEOUT_MS = _int_env("DOTABUFF_BROWSER_TIMEOUT_MS", 45000)
+DOTABUFF_BROWSER_WAIT_MS = _int_env("DOTABUFF_BROWSER_WAIT_MS", 3000)
+DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS = _int_env("DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS", 25000)
+DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS = _int_env("DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS", 15000)
+DOTABUFF_CACHE_TTL_SEC = _int_env("DOTABUFF_CACHE_TTL_SEC", 120)
+DOTABUFF_EMPTY_CACHE_TTL_SEC = _int_env("DOTABUFF_EMPTY_CACHE_TTL_SEC", 30)
 
 # DB_PATH: configurable via env var, defaults to local file or Docker path
 DB_PATH = os.environ.get(

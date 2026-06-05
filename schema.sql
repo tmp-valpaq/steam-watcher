@@ -24,6 +24,12 @@ CREATE TABLE IF NOT EXISTS target_states (
     last_checked INTEGER,
     last_match_id TEXT,
     last_match_time INTEGER,
+    game_playtimes TEXT,
+    visibility_state INTEGER,
+    game_start_time INTEGER,
+    last_session_update INTEGER,
+    daily_playtime_snapshot TEXT,
+    playtime_unit_version INTEGER NOT NULL DEFAULT 2,
     FOREIGN KEY (target_id) REFERENCES targets(id)
 );
 
