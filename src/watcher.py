@@ -62,6 +62,13 @@ def _is_dota_game(game_name: Optional[str]) -> bool:
     return bool(game_name) and "Dota" in game_name
 
 
+def _match_details_url(match_id: str, source: str) -> str:
+    """Return the best public match details URL for a detected Dota match."""
+    if source == "dotabuff":
+        return f"https://www.dotabuff.com/matches/{match_id}"
+    return f"https://www.opendota.com/matches/{match_id}"
+
+
 def generate_alerts(
     target: Target,
     previous_state: Optional[TargetState],
@@ -871,9 +878,11 @@ class Watcher:
                 timing = "Засветился матч Dota 2"
 
             source_suffix = " через Dotabuff" if match.source == "dotabuff" else ""
+            match_url = _match_details_url(match.match_id, match.source)
             message = (
                 f"🕵️ {target.name}: скрытая активность! "
-                f"{timing}{source_suffix} (матч {match.match_id})"
+                f"{timing}{source_suffix} (матч {match.match_id})\n"
+                f"{match_url}"
             )
             # Check per-target invisible alert setting
             target_settings = await db.get_target_settings(self._db, target.id)

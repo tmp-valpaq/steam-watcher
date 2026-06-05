@@ -240,7 +240,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.methods import SendMessage
 
 from src import db
-from src.models import User, UserSettings
+from src.models import MatchInfo, User, UserSettings
 from src.watcher import Watcher
 
 
@@ -307,6 +307,60 @@ class TestEnrichDotaAlert:
         )
         watcher = _make_watcher(MagicMock(), AsyncMock(), match_tracker)
         assert await watcher._enrich_dota_alert(target, "base") is None
+
+
+@pytest.mark.asyncio
+class TestPollMatchesAlertLinks:
+    async def test_dotabuff_hidden_activity_alert_includes_clickable_match_link(self, db_conn):
+        telegram_id = 444
+        await db.save_user(db_conn, User(telegram_id=telegram_id, steam_api_key="k"))
+        target = await db.add_target(
+            db_conn,
+            Target(
+                id=0,
+                telegram_id=telegram_id,
+                steam_id="76561198000000999",
+                name="debustie",
+                interval_seconds=30,
+                active=True,
+            ),
+        )
+        await db.save_target_state(
+            db_conn,
+            TargetState(
+                target_id=target.id,
+                persona_state=0,
+                persona_name="debustie",
+                last_checked=1_700_000_000,
+            ),
+        )
+
+        sent = []
+
+        async def _send(telegram_id, message):
+            sent.append((telegram_id, message))
+
+        match_tracker = MagicMock()
+        match_tracker.get_last_match = AsyncMock(
+            return_value=MatchInfo(
+                match_id="8839259291",
+                steam_id=target.steam_id,
+                game="dota2",
+                duration=1800,
+                start_time=1_699_999_000,
+                hero_name="Invoker",
+                source="dotabuff",
+            )
+        )
+        match_tracker.get_recent_matches = AsyncMock(return_value=[])
+        watcher = _make_watcher(db_conn, _send, match_tracker)
+
+        await watcher._poll_matches()
+
+        assert len(sent) == 1
+        assert sent[0][0] == telegram_id
+        assert "матч 8839259291" in sent[0][1]
+        assert "https://www.dotabuff.com/matches/8839259291" in sent[0][1]
 
 
 @pytest.mark.asyncio
