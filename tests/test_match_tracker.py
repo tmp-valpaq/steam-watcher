@@ -3,7 +3,15 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.match_tracker import MatchTracker, OPENDOTA_API_BASE, DOTABUFF_BASE, DOTABUFF_HEADERS
+from src.match_tracker import (
+    MatchTracker,
+    OPENDOTA_API_BASE,
+    DOTABUFF_BASE,
+    DOTABUFF_HEADERS,
+    _DotabuffFetchResult,
+    _SHORT_RETRYABLE_FAILURE_TTL_SEC,
+    _DOTABUFF_BREAKER_FAILURE_THRESHOLD,
+)
 from src.models import MatchInfo
 
 
@@ -388,6 +396,194 @@ class TestGetRecentMatches:
         assert result[1].hero_name == "Terrorblade"
         assert result[1].duration == 52 * 60 + 2
         assert result[1].start_time == 1780563021
+
+    @pytest.mark.asyncio
+    async def test_mixed_case_latest_matches_uses_static_parse_without_browser(self):
+        html = """
+        <html><body>
+        <section>Latest Matches
+          <div>
+            <a href="/matches/8835491973">match</a>
+            <a href="/heroes/witch-doctor">Witch Doctor</a>
+            <time datetime="2026-06-02T11:22:33Z">1 day ago</time>
+            <span>37:10</span>
+          </div>
+        </section>
+        </body></html>
+        """
+        mock_session = _make_url_routed_session({
+            f"{DOTABUFF_BASE}/players/39734273": (200, html),
+        })
+        tracker = _make_tracker(mock_session)
+        tracker._get_recent_matches_dotabuff_browser = AsyncMock(
+            return_value=_DotabuffFetchResult([], reason="browser_should_not_run")
+        )
+
+        result = await tracker._get_recent_matches_dotabuff("76561198000000001", limit=1)
+
+        assert [m.match_id for m in result] == ["8835491973"]
+        tracker._get_recent_matches_dotabuff_browser.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_dotabuff_cache_reuses_partial_result_across_last_then_recent_calls(self):
+        html = """
+        <html><body>
+        <section>Latest Matches
+          <div>
+            <a href="/matches/8835491973">match</a>
+            <a href="/heroes/witch-doctor">Witch Doctor</a>
+            <time datetime="2026-06-02T11:22:33Z">1 day ago</time>
+            <span>37:10</span>
+          </div>
+          <div>
+            <a href="/matches/8835345201">match</a>
+            <a href="/heroes/grimstroke">Grimstroke</a>
+            <time datetime="2026-06-02T10:10:00Z">1 day ago</time>
+            <span>22:05</span>
+          </div>
+        </section>
+        </body></html>
+        """
+        mock_session = _make_url_routed_session({
+            f"{DOTABUFF_BASE}/players/39734273": (200, html),
+        })
+        tracker = _make_tracker(mock_session)
+        tracker._get_last_match_opendota = AsyncMock(return_value=None)
+        tracker._get_recent_matches_opendota = AsyncMock(return_value=[])
+        tracker._get_recent_matches_dotabuff_browser = AsyncMock(
+            return_value=_DotabuffFetchResult([], reason="browser_should_not_run")
+        )
+
+        last_match = await tracker.get_last_match("76561198000000001")
+        recent_matches = await tracker.get_recent_matches("76561198000000001", limit=3)
+
+        assert last_match is not None
+        assert last_match.match_id == "8835491973"
+        assert [m.match_id for m in recent_matches] == ["8835491973", "8835345201"]
+        assert mock_session.get.call_count == 1
+        tracker._get_recent_matches_dotabuff_browser.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_browser_budget_exhaustion_is_not_cached_as_no_matches(self):
+        mock_session = _make_url_routed_session({
+            f"{DOTABUFF_BASE}/players/39734273": (429, "too many requests"),
+        })
+        tracker = _make_tracker(mock_session)
+        tracker._get_last_match_opendota = AsyncMock(return_value=None)
+        tracker._dotabuff_browser_enabled = True
+        tracker._browser_budget = 0
+        tracker._browser_budget_window_start = 10**12
+
+        with patch("src.match_tracker.DotabuffBrowserClient", object()):
+            first = await tracker.get_last_match("76561198000000001")
+            second = await tracker.get_last_match("76561198000000001")
+
+        assert first is None
+        assert second is None
+        assert mock_session.get.call_count == 2
+        assert "76561198000000001" not in tracker._dotabuff_cache
+
+    @pytest.mark.asyncio
+    async def test_retryable_dotabuff_failures_get_short_ttl_and_classified_reason(self):
+        mock_session = _make_url_routed_session({
+            f"{DOTABUFF_BASE}/players/39734273": (429, "too many requests"),
+        })
+        tracker = _make_tracker(mock_session)
+        tracker._dotabuff_browser_enabled = False
+
+        with patch("src.match_tracker.time.time", return_value=1_000):
+            result = await tracker._get_recent_matches_dotabuff("76561198000000001", limit=1)
+
+        assert result == []
+        cached = tracker._dotabuff_cache["76561198000000001"]
+        assert cached.reason == "http_429__browser_disabled"
+        assert cached.expiry_ts == 1_000 + _SHORT_RETRYABLE_FAILURE_TTL_SEC
+
+    @pytest.mark.asyncio
+    async def test_stable_not_found_dotabuff_failure_keeps_negative_ttl(self):
+        mock_session = _make_url_routed_session({
+            f"{DOTABUFF_BASE}/players/39734273": (404, "player not found"),
+        })
+        tracker = _make_tracker(mock_session)
+        tracker._dotabuff_browser_enabled = False
+
+        with patch("src.match_tracker.time.time", return_value=1_000):
+            result = await tracker._get_recent_matches_dotabuff("76561198000000001", limit=1)
+
+        assert result == []
+        cached = tracker._dotabuff_cache["76561198000000001"]
+        assert cached.reason == "http_404__browser_disabled"
+        assert cached.expiry_ts > 1_000 + _SHORT_RETRYABLE_FAILURE_TTL_SEC
+
+    @pytest.mark.asyncio
+    async def test_stable_not_found_still_caches_when_browser_budget_is_exhausted(self):
+        mock_session = _make_url_routed_session({
+            f"{DOTABUFF_BASE}/players/39734273": (404, "player not found"),
+        })
+        tracker = _make_tracker(mock_session)
+        tracker._dotabuff_browser_enabled = True
+        tracker._browser_budget = 0
+        tracker._browser_budget_window_start = 10**12
+
+        with patch("src.match_tracker.DotabuffBrowserClient", object()), patch(
+            "src.match_tracker.time.time", return_value=1_000
+        ):
+            result = await tracker._get_recent_matches_dotabuff("76561198000000001", limit=1)
+
+        assert result == []
+        cached = tracker._dotabuff_cache["76561198000000001"]
+        assert cached.reason == "http_404__browser_budget_exhausted"
+        assert cached.expiry_ts > 1_000 + _SHORT_RETRYABLE_FAILURE_TTL_SEC
+
+    @pytest.mark.asyncio
+    async def test_repeated_throttle_failures_open_global_dotabuff_breaker(self):
+        mock_session = _make_url_routed_session({
+            f"{DOTABUFF_BASE}/players/39734273": (429, "too many requests"),
+            f"{DOTABUFF_BASE}/players/39734274": (429, "too many requests"),
+            f"{DOTABUFF_BASE}/players/39734275": (429, "too many requests"),
+            f"{DOTABUFF_BASE}/players/39734276": (429, "too many requests"),
+        })
+        tracker = _make_tracker(mock_session)
+        tracker._dotabuff_browser_enabled = False
+
+        steam_ids = [
+            "76561198000000001",
+            "76561198000000002",
+            "76561198000000003",
+            "76561198000000004",
+        ]
+        first_three = steam_ids[:_DOTABUFF_BREAKER_FAILURE_THRESHOLD]
+        for steam_id in first_three:
+            assert await tracker._get_recent_matches_dotabuff(steam_id, limit=1) == []
+
+        assert tracker._dotabuff_failure_streak == _DOTABUFF_BREAKER_FAILURE_THRESHOLD
+        assert tracker._dotabuff_breaker_open_until > 0
+
+        before_calls = mock_session.get.call_count
+        blocked = await tracker._get_recent_matches_dotabuff(steam_ids[3], limit=1)
+
+        assert blocked == []
+        assert mock_session.get.call_count == before_calls
+
+    @pytest.mark.asyncio
+    async def test_dotabuff_breaker_resets_after_cooldown(self):
+        mock_session = _make_url_routed_session({
+            f"{DOTABUFF_BASE}/players/39734276": (429, "too many requests"),
+        })
+        tracker = _make_tracker(mock_session)
+        tracker._dotabuff_browser_enabled = False
+        tracker._dotabuff_failure_streak = _DOTABUFF_BREAKER_FAILURE_THRESHOLD
+        tracker._dotabuff_last_failure_reason = "http_429__browser_disabled"
+        tracker._dotabuff_breaker_open_until = 1_500
+
+        with patch("src.match_tracker.time.time", return_value=1_501):
+            result = await tracker._get_recent_matches_dotabuff("76561198000000004", limit=1)
+
+        assert result == []
+        assert mock_session.get.call_count == 1
+        assert tracker._dotabuff_failure_streak == 1
+        assert tracker._dotabuff_last_failure_reason == "http_429__browser_disabled"
+        assert tracker._dotabuff_breaker_open_until == 0.0
 
 
 class TestGetLastMatchesBatch:

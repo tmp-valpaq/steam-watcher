@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 import logging
 import re
 import time
@@ -61,9 +62,12 @@ _RELATIVE_TIME_RE = re.compile(
 # empty-cache TTL knob. Aliased from config so the literal lives in one place.
 _MATCH_POLL_INTERVAL_SEC = MATCH_POLL_INTERVAL
 _NEGATIVE_CACHE_TTL_SEC = max(DOTABUFF_EMPTY_CACHE_TTL_SEC, _MATCH_POLL_INTERVAL_SEC)
+_SHORT_RETRYABLE_FAILURE_TTL_SEC = min(30, _MATCH_POLL_INTERVAL_SEC)
 # Upper bound on headless-browser launches per poll cycle, so a sweep of many
 # offline non-Dota targets cannot fan out into many Chromium contexts at once.
 _BROWSER_LAUNCH_BUDGET_PER_CYCLE = 2
+_DOTABUFF_BREAKER_FAILURE_THRESHOLD = 3
+_DOTABUFF_BREAKER_COOLDOWN_SEC = _MATCH_POLL_INTERVAL_SEC
 # How long an OpenDota rank lookup (positive OR empty) stays cached. Empties are
 # cached too so MMR-less players aren't re-fetched on every alert.
 _RANK_CACHE_TTL_SEC = 600
@@ -76,13 +80,28 @@ _DURATION_RE = re.compile(r">\s*((?:\d+:)?\d{1,2}:\d{2})\s*<")
 _TITLE_TS_RE = re.compile(r'title="([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4}[^\"]*)"')
 
 
+@dataclass
+class _DotabuffCacheEntry:
+    expiry_ts: float
+    matches: List[MatchInfo]
+    fetched_limit: int
+    reason: str
+
+
+@dataclass
+class _DotabuffFetchResult:
+    matches: List[MatchInfo]
+    reason: str
+    cacheable: bool = True
+
+
 class MatchTracker:
     """Dota match tracker: OpenDota primary, Dotabuff best-effort fallback."""
 
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
         self._hero_cache: Dict[int, str] = {}
-        self._dotabuff_cache: Dict[str, Tuple[float, List[MatchInfo]]] = {}
+        self._dotabuff_cache: Dict[str, _DotabuffCacheEntry] = {}
         # steam_id -> (expiry_ts, rank_dict_or_None). Caches positive and empty
         # OpenDota rank lookups so players with no MMR aren't re-fetched per alert.
         self._rank_cache: Dict[str, Tuple[float, Optional[dict]]] = {}
@@ -94,6 +113,9 @@ class MatchTracker:
         # offline non-Dota targets can launch at most a handful of browsers.
         self._browser_budget: int = _BROWSER_LAUNCH_BUDGET_PER_CYCLE
         self._browser_budget_window_start: float = 0.0
+        self._dotabuff_failure_streak: int = 0
+        self._dotabuff_breaker_open_until: float = 0.0
+        self._dotabuff_last_failure_reason: Optional[str] = None
 
     async def _rate_limit(self) -> None:
         """Ensure we don't exceed 1 request per second to OpenDota."""
@@ -458,20 +480,133 @@ class MatchTracker:
         self._browser_budget -= 1
         return True
 
-    async def _get_recent_matches_dotabuff_browser(self, steam_id: str, limit: int) -> List[MatchInfo]:
+    @staticmethod
+    def _classify_dotabuff_http_outcome(status: int, html: str) -> str:
+        lowered = (html or "")[:5000].lower()
+        if status == 200:
+            if "just a moment" in lowered or "cloudflare" in lowered:
+                return "http_challenge_blocked"
+            return "http_200"
+        if status == 403:
+            return "http_403"
+        if status == 404:
+            return "http_404"
+        if status == 429:
+            return "http_429"
+        if status == 503:
+            return "http_503"
+        return f"http_{status}"
+
+    @staticmethod
+    def _split_dotabuff_reason(reason: str) -> List[str]:
+        return [part for part in (reason or "").split("__") if part]
+
+    @classmethod
+    def _combine_dotabuff_reasons(cls, *reasons: Optional[str]) -> str:
+        parts: List[str] = []
+        for reason in reasons:
+            if not reason:
+                continue
+            for part in cls._split_dotabuff_reason(reason):
+                if part not in parts:
+                    parts.append(part)
+        return "__".join(parts)
+
+    @classmethod
+    def _is_dotabuff_throttle_reason(cls, reason: str) -> bool:
+        throttle_parts = {
+            "http_403",
+            "http_429",
+            "http_503",
+            "http_challenge_blocked",
+            "browser_challenge_blocked",
+        }
+        return any(part in throttle_parts for part in cls._split_dotabuff_reason(reason))
+
+    @classmethod
+    def _is_dotabuff_stable_empty_reason(cls, reason: str) -> bool:
+        stable_parts = {
+            "invalid_account",
+            "http_404",
+            "browser_not_found",
+        }
+        parts = cls._split_dotabuff_reason(reason)
+        return any(part in stable_parts for part in parts) and not cls._is_dotabuff_throttle_reason(reason)
+
+    @classmethod
+    def _is_dotabuff_retryable_failure_reason(cls, reason: str) -> bool:
+        parts = cls._split_dotabuff_reason(reason)
+        if not parts:
+            return False
+        if cls._is_dotabuff_throttle_reason(reason):
+            return True
+        retryable_parts = {
+            "http_fetch_failed",
+            "static_parser_empty",
+            "browser_disabled",
+            "browser_budget_exhausted",
+            "browser_failed",
+            "browser_login_gated",
+            "browser_unknown",
+            "browser_parser_empty",
+        }
+        return any(part in retryable_parts for part in parts)
+
+    def _dotabuff_breaker_is_open(self) -> bool:
+        now = time.time()
+        if self._dotabuff_breaker_open_until and now >= self._dotabuff_breaker_open_until:
+            self._dotabuff_breaker_open_until = 0.0
+            self._dotabuff_failure_streak = 0
+            self._dotabuff_last_failure_reason = None
+        return self._dotabuff_breaker_open_until > now
+
+    def _record_dotabuff_result(self, result: _DotabuffFetchResult) -> None:
+        if result.matches:
+            self._dotabuff_failure_streak = 0
+            self._dotabuff_breaker_open_until = 0.0
+            self._dotabuff_last_failure_reason = None
+            return
+
+        reason = result.reason
+        if self._is_dotabuff_throttle_reason(reason):
+            self._dotabuff_failure_streak += 1
+            self._dotabuff_last_failure_reason = reason
+            if self._dotabuff_failure_streak >= _DOTABUFF_BREAKER_FAILURE_THRESHOLD:
+                self._dotabuff_breaker_open_until = max(
+                    self._dotabuff_breaker_open_until,
+                    time.time() + _DOTABUFF_BREAKER_COOLDOWN_SEC,
+                )
+            return
+
+        self._dotabuff_failure_streak = 0
+        self._dotabuff_last_failure_reason = reason if reason else None
+
+    @classmethod
+    def _dotabuff_cache_ttl_for_reason(cls, reason: str, has_matches: bool) -> int:
+        if has_matches:
+            return DOTABUFF_CACHE_TTL_SEC
+        if cls._is_dotabuff_stable_empty_reason(reason):
+            return _NEGATIVE_CACHE_TTL_SEC
+        if cls._is_dotabuff_throttle_reason(reason) or cls._is_dotabuff_retryable_failure_reason(reason):
+            return _SHORT_RETRYABLE_FAILURE_TTL_SEC
+        return _NEGATIVE_CACHE_TTL_SEC
+
+    async def _get_recent_matches_dotabuff_browser(
+        self, steam_id: str, limit: int
+    ) -> _DotabuffFetchResult:
         if not self._dotabuff_browser_enabled or DotabuffBrowserClient is None:
-            return []
+            return _DotabuffFetchResult([], reason="browser_disabled")
         if not self._try_acquire_browser_budget():
             logger.info(
                 "Dotabuff browser budget exhausted this cycle; skipping browser fetch for %s",
                 steam_id,
             )
-            return []
+            return _DotabuffFetchResult([], reason="browser_budget_exhausted", cacheable=False)
         browser_client_cls = DotabuffBrowserClient
 
         account_id = self._to_account_id(steam_id)
         if account_id is None or account_id <= 0:
-            return []
+            return _DotabuffFetchResult([], reason="invalid_account")
 
         async def _run_browser_fetch() -> dict:
             async with browser_client_cls(
@@ -494,11 +629,12 @@ class MatchTracker:
             )
         except Exception as e:
             logger.warning("Dotabuff browser fetch failed for %s: %s", steam_id, e)
-            return []
+            return _DotabuffFetchResult([], reason="browser_failed")
 
-        if result.get("status") != "accessible_recent_matches":
-            logger.info("Dotabuff browser returned %s for %s", result.get("status"), steam_id)
-            return []
+        status = result.get("status")
+        if status != "accessible_recent_matches":
+            logger.info("Dotabuff browser returned %s for %s", status, steam_id)
+            return _DotabuffFetchResult([], reason=f"browser_{status or 'unknown'}")
 
         matches = self._parse_dotabuff_browser_rows(result.get("rows") or [], steam_id, limit=limit)
         if matches:
@@ -507,20 +643,29 @@ class MatchTracker:
                 len(matches),
                 steam_id,
             )
-        return matches
+            return _DotabuffFetchResult(matches, reason="browser_success")
+        return _DotabuffFetchResult([], reason="browser_parser_empty")
 
     async def _get_recent_matches_dotabuff(self, steam_id: str, limit: int) -> List[MatchInfo]:
         fetch_limit = max(limit, 3)
         cached = self._dotabuff_cache.get(steam_id)
         now = time.time()
-        if cached and cached[0] > now:
-            if not cached[1]:
+        if cached and cached.expiry_ts > now and cached.fetched_limit >= fetch_limit:
+            if not cached.matches:
                 return []
-            if len(cached[1]) >= limit:
-                return cached[1][:limit]
+            return cached.matches[:limit]
 
         account_id = self._to_account_id(steam_id)
         if account_id is None or account_id <= 0:
+            return []
+
+        if self._dotabuff_breaker_is_open():
+            logger.info(
+                "Dotabuff breaker open until %.0f; skipping fetch for %s after %s",
+                self._dotabuff_breaker_open_until,
+                steam_id,
+                self._dotabuff_last_failure_reason or "unknown failure",
+            )
             return []
 
         url = f"{DOTABUFF_BASE}/players/{account_id}"
@@ -528,34 +673,56 @@ class MatchTracker:
             status, html = await self._get_text(url, headers=DOTABUFF_HEADERS)
         except Exception as e:
             logger.warning("Dotabuff fetch failed for %s: %s", steam_id, e)
+            result = _DotabuffFetchResult([], reason="http_fetch_failed")
+            self._record_dotabuff_result(result)
+            ttl = self._dotabuff_cache_ttl_for_reason(result.reason, False)
+            self._dotabuff_cache[steam_id] = _DotabuffCacheEntry(
+                expiry_ts=now + ttl,
+                matches=[],
+                fetched_limit=fetch_limit,
+                reason=result.reason,
+            )
             return []
 
-        if status != 200:
-            logger.info("Dotabuff returned %s for %s", status, steam_id)
-            matches = await self._get_recent_matches_dotabuff_browser(steam_id, fetch_limit)
-            ttl = DOTABUFF_CACHE_TTL_SEC if matches else _NEGATIVE_CACHE_TTL_SEC
-            self._dotabuff_cache[steam_id] = (now + ttl, matches)
-            return matches[:limit]
+        http_reason = self._classify_dotabuff_http_outcome(status, html)
+        result: _DotabuffFetchResult
+        if http_reason != "http_200":
+            logger.info("Dotabuff returned %s for %s", http_reason, steam_id)
+            browser_result = await self._get_recent_matches_dotabuff_browser(steam_id, fetch_limit)
+            combined_reason = self._combine_dotabuff_reasons(http_reason, browser_result.reason)
+            result = _DotabuffFetchResult(
+                browser_result.matches,
+                reason=combined_reason,
+                cacheable=browser_result.cacheable or self._is_dotabuff_stable_empty_reason(http_reason),
+            )
+        else:
+            matches = self._parse_dotabuff_matches(html, steam_id, limit=fetch_limit)
+            if matches:
+                result = _DotabuffFetchResult(matches, reason="static_parse_success")
+            else:
+                browser_result = await self._get_recent_matches_dotabuff_browser(steam_id, fetch_limit)
+                result = _DotabuffFetchResult(
+                    browser_result.matches,
+                    reason=self._combine_dotabuff_reasons("static_parser_empty", browser_result.reason),
+                    cacheable=browser_result.cacheable,
+                )
 
-        if "LATEST MATCHES" not in html or "Just a moment" in html:
-            logger.info("Dotabuff page for %s did not expose match rows", steam_id)
-            matches = await self._get_recent_matches_dotabuff_browser(steam_id, fetch_limit)
-            ttl = DOTABUFF_CACHE_TTL_SEC if matches else _NEGATIVE_CACHE_TTL_SEC
-            self._dotabuff_cache[steam_id] = (now + ttl, matches)
-            return matches[:limit]
-
-        matches = self._parse_dotabuff_matches(html, steam_id, limit=fetch_limit)
-        if not matches:
-            matches = await self._get_recent_matches_dotabuff_browser(steam_id, fetch_limit)
-        ttl = DOTABUFF_CACHE_TTL_SEC if matches else _NEGATIVE_CACHE_TTL_SEC
-        self._dotabuff_cache[steam_id] = (now + ttl, matches)
-        if matches:
+        self._record_dotabuff_result(result)
+        if result.cacheable:
+            ttl = self._dotabuff_cache_ttl_for_reason(result.reason, bool(result.matches))
+            self._dotabuff_cache[steam_id] = _DotabuffCacheEntry(
+                expiry_ts=now + ttl,
+                matches=result.matches,
+                fetched_limit=fetch_limit,
+                reason=result.reason,
+            )
+        if result.matches:
             logger.info(
                 "Dotabuff fallback returned %d match(es) for %s",
-                len(matches),
+                len(result.matches),
                 steam_id,
             )
-        return matches[:limit]
+        return result.matches[:limit]
 
     async def get_last_match(self, steam_id: str) -> Optional[MatchInfo]:
         """Fetch the most recent Dota 2 match for a Steam ID."""
