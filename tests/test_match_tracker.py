@@ -3,7 +3,7 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from src.match_tracker import MatchTracker, OPENDOTA_API_BASE, DOTABUFF_BASE
+from src.match_tracker import MatchTracker, OPENDOTA_API_BASE, DOTABUFF_BASE, DOTABUFF_HEADERS
 from src.models import MatchInfo
 
 
@@ -198,6 +198,13 @@ class TestGetLastMatch:
 
 
 class TestGetRecentMatches:
+    def test_dotabuff_headers_include_browser_like_navigation_fields(self):
+        assert DOTABUFF_HEADERS["Referer"] == "https://www.dotabuff.com/"
+        assert DOTABUFF_HEADERS["Sec-Fetch-Site"] == "same-origin"
+        assert DOTABUFF_HEADERS["Sec-Fetch-Mode"] == "navigate"
+        assert DOTABUFF_HEADERS["Sec-Fetch-Dest"] == "document"
+        assert DOTABUFF_HEADERS["Upgrade-Insecure-Requests"] == "1"
+
     @pytest.mark.asyncio
     async def test_recent_matches_use_dotabuff_fallback(self):
         html = """
@@ -323,6 +330,64 @@ class TestGetRecentMatches:
         result = tracker._parse_dotabuff_matches(html, "76561198000000001", limit=2)
 
         assert [m.match_id for m in result] == ["111"]
+
+    def test_static_dotabuff_parser_handles_modern_overview_rows(self):
+        tracker = _make_tracker(MagicMock())
+        html = """
+        <html><body>
+        Latest Matches<div class="more"><a href="/players/1258333388/matches">more</a></div></header><article>
+          <div class="r-table r-only-mobile-5 performances-overview">
+            <div class="r-row ">
+              <div class="r-fluid r-40 r-icon-text">
+                <div class="r-body">
+                  <a href="/heroes/drow-ranger"><img alt="Drow Ranger"/></a>
+                  <a href="/matches/8838344748">Drow Ranger</a>
+                </div>
+              </div>
+              <div class="r-fluid r-175 r-text-only r-right r-match-result">
+                <div class="r-body">
+                  <a class="lost" href="/matches/8838344748">Lost Match</a>
+                  <div class="subtext"><time datetime="2026-06-04T16:26:35+00:00" title="Thu, 04 Jun 2026 16:26:35 +0000">2026-06-04</time></div>
+                </div>
+              </div>
+              <div class="r-fluid r-125 r-line-graph r-duration">
+                <div class="r-label">Duration</div>
+                <div class="r-body">38:30<div class="bar"></div></div>
+              </div>
+              <div class="clearfix"></div>
+            </div>
+            <div class="r-row ">
+              <div class="r-fluid r-40 r-icon-text">
+                <div class="r-body">
+                  <a href="/heroes/terrorblade"><img alt="Terrorblade"/></a>
+                  <a href="/matches/8837828534">Terrorblade</a>
+                </div>
+              </div>
+              <div class="r-fluid r-175 r-text-only r-right r-match-result">
+                <div class="r-body">
+                  <a class="won" href="/matches/8837828534">Won Match</a>
+                  <div class="subtext"><time datetime="2026-06-04T08:50:21+00:00" title="Thu, 04 Jun 2026 08:50:21 +0000">2026-06-04</time></div>
+                </div>
+              </div>
+              <div class="r-fluid r-125 r-line-graph r-duration">
+                <div class="r-label">Duration</div>
+                <div class="r-body">52:02<div class="bar"></div></div>
+              </div>
+              <div class="clearfix"></div>
+            </div>
+          </div>
+        </body></html>
+        """
+
+        result = tracker._parse_dotabuff_matches(html, "76561198000000001", limit=2)
+
+        assert [m.match_id for m in result] == ["8838344748", "8837828534"]
+        assert result[0].hero_name == "Drow Ranger"
+        assert result[0].duration == 38 * 60 + 30
+        assert result[0].start_time == 1780590395
+        assert result[1].hero_name == "Terrorblade"
+        assert result[1].duration == 52 * 60 + 2
+        assert result[1].start_time == 1780563021
 
 
 class TestGetLastMatchesBatch:

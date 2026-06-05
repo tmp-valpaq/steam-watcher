@@ -43,6 +43,11 @@ DOTABUFF_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9",
     "Cache-Control": "no-cache",
     "Pragma": "no-cache",
+    "Referer": "https://www.dotabuff.com/",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+    "Upgrade-Insecure-Requests": "1",
 }
 _RELATIVE_TIME_RE = re.compile(
     r"(?:(?P<article>a|an)\s+|(?P<value>\d+)\s+)"
@@ -328,12 +333,49 @@ class MatchTracker:
         limit: int,
     ) -> List[MatchInfo]:
         section = html
-        latest_idx = html.find("LATEST MATCHES")
+        latest_idx = html.lower().find("latest matches")
         if latest_idx >= 0:
             section = html[latest_idx: latest_idx + 50000]
 
+        row_chunks = section.split('<div class="r-row ')
+        if len(row_chunks) > 1:
+            matches: List[MatchInfo] = []
+            seen = set()
+            for row in row_chunks[1:]:
+                chunk = row
+                match = _MATCH_LINK_RE.search(chunk)
+                if not match:
+                    continue
+                match_id = match.group(1)
+                if match_id in seen:
+                    continue
+                seen.add(match_id)
+
+                hero_match = _HERO_SLUG_RE.search(chunk)
+                hero_name = self._hero_name_from_slug(hero_match.group(1) if hero_match else None)
+                duration_match = _DURATION_RE.search(chunk)
+                duration = self._parse_duration(duration_match.group(1) if duration_match else None)
+                start_time = self._parse_timestamp_from_chunk(chunk)
+                if start_time is None or duration <= 0:
+                    continue
+
+                matches.append(
+                    self._make_match_info(
+                        steam_id,
+                        match_id,
+                        duration,
+                        start_time,
+                        hero_name,
+                        source="dotabuff",
+                    )
+                )
+                if len(matches) >= limit:
+                    break
+            if matches:
+                return matches
+
         seen = set()
-        matches: List[MatchInfo] = []
+        matches = []
         match_links = list(_MATCH_LINK_RE.finditer(section))
         for idx, match in enumerate(match_links):
             match_id = match.group(1)
