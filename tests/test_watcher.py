@@ -240,7 +240,7 @@ from aiogram.exceptions import TelegramForbiddenError
 from aiogram.methods import SendMessage
 
 from src import db
-from src.models import MatchInfo, User, UserSettings
+from src.models import MatchInfo, SteamProfile, TargetState, User, UserSettings
 from src.watcher import Watcher
 
 
@@ -311,6 +311,51 @@ class TestEnrichDotaAlert:
 
 @pytest.mark.asyncio
 class TestPollMatchesAlertLinks:
+    async def test_check_target_preserves_last_sent_match_state(self, db_conn, monkeypatch):
+        telegram_id = 443
+        await db.save_user(db_conn, User(telegram_id=telegram_id, steam_api_key="k"))
+        target = await db.add_target(
+            db_conn,
+            Target(
+                id=0,
+                telegram_id=telegram_id,
+                steam_id="76561198000000443",
+                name="debustie",
+                interval_seconds=30,
+                active=True,
+            ),
+        )
+        await db.save_target_state(
+            db_conn,
+            TargetState(
+                target_id=target.id,
+                persona_state=0,
+                persona_name="debustie",
+                last_checked=1_700_000_000,
+                last_match_id="8839259291",
+                last_match_time=1_700_000_010,
+            ),
+        )
+
+        monkeypatch.setattr("src.watcher.time.time", lambda: 1_700_000_030)
+        watcher = _make_watcher(db_conn, AsyncMock(), match_tracker=None)
+        profile = SteamProfile(
+            steam_id=target.steam_id,
+            persona_name="debustie",
+            persona_state=0,
+            game_id="570",
+            game_name="Dota 2",
+            last_logoff=None,
+            visibility_state=3,
+        )
+
+        await watcher._check_target("k", target, profile)
+
+        state = await db.get_target_state(db_conn, target.id)
+        assert state is not None
+        assert state.last_match_id == "8839259291"
+        assert state.last_match_time == 1_700_000_010
+
     async def test_dotabuff_hidden_activity_alert_includes_clickable_match_link(self, db_conn):
         telegram_id = 444
         await db.save_user(db_conn, User(telegram_id=telegram_id, steam_api_key="k"))
@@ -361,6 +406,67 @@ class TestPollMatchesAlertLinks:
         assert sent[0][0] == telegram_id
         assert "матч 8839259291" in sent[0][1]
         assert "https://www.dotabuff.com/matches/8839259291" in sent[0][1]
+
+    async def test_poll_matches_skips_already_logged_match_id(self, db_conn):
+        telegram_id = 445
+        await db.save_user(db_conn, User(telegram_id=telegram_id, steam_api_key="k"))
+        target = await db.add_target(
+            db_conn,
+            Target(
+                id=0,
+                telegram_id=telegram_id,
+                steam_id="76561198000000445",
+                name="debustie",
+                interval_seconds=30,
+                active=True,
+            ),
+        )
+        await db.save_target_state(
+            db_conn,
+            TargetState(
+                target_id=target.id,
+                persona_state=0,
+                persona_name="debustie",
+                last_checked=1_700_000_000,
+            ),
+        )
+        await db.save_activity(
+            db_conn,
+            target.id,
+            "match",
+            game_name="Dota 2",
+            match_id="8839103634",
+            detected_at=1_700_000_005,
+        )
+
+        sent = []
+
+        async def _send(telegram_id, message):
+            sent.append((telegram_id, message))
+
+        match_tracker = MagicMock()
+        match_tracker.get_last_match = AsyncMock(
+            return_value=MatchInfo(
+                match_id="8839103634",
+                steam_id=target.steam_id,
+                game="dota2",
+                duration=1800,
+                start_time=1_699_999_000,
+                hero_name="Invoker",
+                source="dotabuff",
+            )
+        )
+        match_tracker.get_recent_matches = AsyncMock(return_value=[])
+        watcher = _make_watcher(db_conn, _send, match_tracker)
+
+        await watcher._poll_matches()
+
+        assert sent == []
+        activity = await db.get_activity_log(db_conn, target.id, limit=10, event_types=["match"])
+        assert len(activity) == 1
+        state = await db.get_target_state(db_conn, target.id)
+        assert state is not None
+        assert state.last_match_id == "8839103634"
 
 
 @pytest.mark.asyncio

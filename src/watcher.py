@@ -485,6 +485,8 @@ class Watcher:
             playtime_forever=total_playtime,
             last_logoff=profile.last_logoff,
             last_checked=now,
+            last_match_id=previous_state.last_match_id if previous_state else None,
+            last_match_time=previous_state.last_match_time if previous_state else None,
             game_playtimes=json.dumps(current_game_pts),
             visibility_state=profile.visibility_state,
             game_start_time=game_start_time,
@@ -852,6 +854,12 @@ class Watcher:
                 continue
 
             if match.match_id == state.last_match_id:
+                continue
+
+            if await db.has_activity(self._db, target.id, "match", match_id=match.match_id):
+                state.last_match_id = match.match_id
+                state.last_match_time = now
+                await db.save_target_state(self._db, state)
                 continue
 
             state.last_match_id = match.match_id

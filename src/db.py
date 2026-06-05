@@ -554,6 +554,26 @@ async def save_activity(
     await db.commit()
 
 
+async def has_activity(
+    db: aiosqlite.Connection,
+    target_id: int,
+    event_type: str,
+    *,
+    match_id: Optional[str] = None,
+) -> bool:
+    """True if an activity row already exists for this target/event identity."""
+    query = "SELECT 1 FROM activity_log WHERE target_id = ? AND event_type = ?"
+    params: list = [target_id, event_type]
+    if match_id is None:
+        query += " AND match_id IS NULL"
+    else:
+        query += " AND match_id = ?"
+        params.append(match_id)
+    query += " LIMIT 1"
+    async with db.execute(query, params) as cur:
+        return await cur.fetchone() is not None
+
+
 async def save_activity_batch(
     db: aiosqlite.Connection,
     entries: list,
