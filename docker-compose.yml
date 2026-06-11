@@ -1,7 +1,9 @@
 services:
   bot:
     build: .
+    init: true
     env_file: .env
+    entrypoint: ["ionice", "-c3", "nice", "-n", "15", "python", "-m", "src.main"]
     environment:
       - DB_PATH=/app/data/steam_watcher.db
       - DOTABUFF_BROWSER_ENABLED=1

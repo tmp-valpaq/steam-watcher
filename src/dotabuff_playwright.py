@@ -2,6 +2,7 @@ import argparse
 import asyncio
 import json
 import re
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -31,41 +32,60 @@ class DotabuffBrowserClient:
         self._timeout_ms = int(timeout_ms)
         self._headless = headless
         self._cookies_json = Path(cookies_json) if cookies_json else None
+        self._playwright = None
+        self._browser = None
 
     async def __aenter__(self) -> "DotabuffBrowserClient":
-        self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch_persistent_context(
-            user_data_dir=str(self._profile_dir),
-            headless=self._headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/136.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1440, "height": 1200},
-            locale="en-US",
-            timezone_id="UTC",
-        )
-        await self._browser.add_init_script(
-            """
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            window.chrome = window.chrome || { runtime: {} };
-            """
-        )
-        await self._maybe_load_cookies()
-        return self
+        try:
+            self._playwright = await async_playwright().start()
+            self._browser = await self._playwright.chromium.launch_persistent_context(
+                user_data_dir=str(self._profile_dir),
+                headless=self._headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--disable-dev-shm-usage",
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                ],
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/136.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1440, "height": 1200},
+                locale="en-US",
+                timezone_id="UTC",
+            )
+            await self._browser.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                window.chrome = window.chrome || { runtime: {} };
+                """
+            )
+            await self._maybe_load_cookies()
+            return self
+        except BaseException:
+            await asyncio.shield(self._close_browser())
+            raise
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self._browser.close()
-        await self._playwright.stop()
+        await asyncio.shield(self._close_browser())
+
+    async def _close_browser(self) -> None:
+        browser = self._browser
+        playwright = self._playwright
+        self._browser = None
+        self._playwright = None
+
+        if browser is not None:
+            with suppress(Exception):
+                await browser.close()
+
+        if playwright is not None:
+            with suppress(Exception):
+                await playwright.stop()
 
     async def _maybe_load_cookies(self) -> None:
         if not self._cookies_json:
@@ -193,6 +213,12 @@ class DotabuffBrowserClient:
             json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
             return result
         finally:
+            with suppress(Exception):
+                page.remove_listener("response", on_response)
+            await asyncio.shield(self._close_page(page))
+
+    async def _close_page(self, page) -> None:
+        with suppress(Exception):
             await page.close()
 
     async def _extract_visible_text(self, page) -> str:
