@@ -27,36 +27,55 @@ class DotabuffBrowserClient:
         timeout_ms: int = DEFAULT_TIMEOUT_MS,
         headless: bool = True,
         cookies_json: Optional[Path] = None,
+        ws_endpoint: Optional[str] = None,
     ):
         self._profile_dir = Path(profile_dir)
         self._timeout_ms = int(timeout_ms)
         self._headless = headless
         self._cookies_json = Path(cookies_json) if cookies_json else None
+        self._ws_endpoint = (ws_endpoint or "").strip() or None
         self._playwright = None
         self._browser = None
+        self._context = None
+        self._owns_context = False
 
     async def __aenter__(self) -> "DotabuffBrowserClient":
         try:
             self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch_persistent_context(
-                user_data_dir=str(self._profile_dir),
-                headless=self._headless,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--disable-dev-shm-usage",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                ],
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/136.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1440, "height": 1200},
-                locale="en-US",
-                timezone_id="UTC",
-            )
-            await self._browser.add_init_script(
+            if self._ws_endpoint:
+                self._browser = await self._playwright.chromium.connect(self._ws_endpoint)
+                self._context = await self._browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/136.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1440, "height": 1200},
+                    locale="en-US",
+                    timezone_id="UTC",
+                )
+                self._owns_context = True
+            else:
+                self._context = await self._playwright.chromium.launch_persistent_context(
+                    user_data_dir=str(self._profile_dir),
+                    headless=self._headless,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--disable-dev-shm-usage",
+                        "--no-first-run",
+                        "--no-default-browser-check",
+                    ],
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/136.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1440, "height": 1200},
+                    locale="en-US",
+                    timezone_id="UTC",
+                )
+                self._owns_context = True
+            await self._context.add_init_script(
                 """
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
                 Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
@@ -75,9 +94,17 @@ class DotabuffBrowserClient:
 
     async def _close_browser(self) -> None:
         browser = self._browser
+        context = self._context
         playwright = self._playwright
+        owns_context = self._owns_context
         self._browser = None
+        self._context = None
         self._playwright = None
+        self._owns_context = False
+
+        if context is not None and owns_context:
+            with suppress(Exception):
+                await context.close()
 
         if browser is not None:
             with suppress(Exception):
@@ -95,7 +122,7 @@ class DotabuffBrowserClient:
         if not isinstance(cookies, list):
             raise ValueError("cookies_json must contain a cookie list or {\"cookies\": [...]} payload")
         if cookies:
-            await self._browser.add_cookies(cookies)
+            await self._context.add_cookies(cookies)
 
     async def fetch_player_matches(
         self,
@@ -109,7 +136,7 @@ class DotabuffBrowserClient:
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        page = await self._browser.new_page()
+        page = await self._context.new_page()
         page.set_default_timeout(self._timeout_ms)
 
         captured_responses: List[Dict[str, Any]] = []

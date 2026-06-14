@@ -44,6 +44,7 @@ ALLOWED_TELEGRAM_IDS = _parse_id_set(os.environ.get("ALLOWED_TELEGRAM_IDS", ""))
 CHECK_MIN_INTERVAL_SEC = _int_env("CHECK_MIN_INTERVAL_SEC", 3)
 
 DOTABUFF_BROWSER_ENABLED = os.environ.get("DOTABUFF_BROWSER_ENABLED", "0") == "1"
+DOTABUFF_BROWSER_WS_ENDPOINT = os.environ.get("DOTABUFF_BROWSER_WS_ENDPOINT", "").strip()
 DOTABUFF_BROWSER_PROFILE_DIR = os.environ.get(
     "DOTABUFF_BROWSER_PROFILE_DIR",
     os.path.join(os.path.dirname(__file__), "..", ".cache", "dotabuff-playwright-profile"),

@@ -18,6 +18,7 @@ from .config import (
     DOTABUFF_BROWSER_TIMEOUT_MS,
     DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS,
     DOTABUFF_BROWSER_WAIT_MS,
+    DOTABUFF_BROWSER_WS_ENDPOINT,
     DOTABUFF_CACHE_TTL_SEC,
     DOTABUFF_EMPTY_CACHE_TTL_SEC,
     MATCH_POLL_INTERVAL,
@@ -613,6 +614,7 @@ class MatchTracker:
                 profile_dir=Path(DOTABUFF_BROWSER_PROFILE_DIR),
                 timeout_ms=DOTABUFF_BROWSER_TIMEOUT_MS,
                 headless=True,
+                ws_endpoint=DOTABUFF_BROWSER_WS_ENDPOINT or None,
             ) as client:
                 return await client.fetch_player_matches(
                     str(account_id),

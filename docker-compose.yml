@@ -1,12 +1,17 @@
 services:
   bot:
-    build: .
+    build:
+      context: .
+      args:
+        INSTALL_DOTABUFF_BROWSER: ${INSTALL_DOTABUFF_BROWSER:-1}
+        INSTALL_LOCAL_CHROMIUM: ${INSTALL_LOCAL_CHROMIUM:-1}
     init: true
     env_file: .env
     entrypoint: ["ionice", "-c3", "nice", "-n", "15", "python", "-m", "src.main"]
     environment:
       - DB_PATH=/app/data/steam_watcher.db
-      - DOTABUFF_BROWSER_ENABLED=1
+      - DOTABUFF_BROWSER_ENABLED=${DOTABUFF_BROWSER_ENABLED:-1}
+      - DOTABUFF_BROWSER_WS_ENDPOINT=${DOTABUFF_BROWSER_WS_ENDPOINT:-}
     volumes:
       - ./data:/app/data
       - ./.cache:/app/.cache
