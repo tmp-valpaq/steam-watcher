@@ -8,7 +8,7 @@ from typing import Optional, List
 
 import aiosqlite
 
-from .models import User, Target, TargetState, UserSettings
+from .models import User, Target, TargetState, UserSettings, SteamProfileBlacklistEntry
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,14 @@ async def init_db(db: aiosqlite.Connection) -> None:
             await cur.execute(
                 "ALTER TABLE user_settings ADD COLUMN timezone TEXT NOT NULL DEFAULT 'UTC'"
             )
+        await cur.execute(
+            "CREATE TABLE IF NOT EXISTS steam_profile_blacklist ("
+            "steam_id TEXT PRIMARY KEY, "
+            "reason TEXT, "
+            "created_at INTEGER NOT NULL, "
+            "created_by INTEGER"
+            ")"
+        )
     await db.commit()
 
 
@@ -275,6 +283,88 @@ async def rename_target(
     )
     await db.commit()
     return cursor.rowcount > 0
+
+
+async def set_target_interval(
+    db: aiosqlite.Connection,
+    telegram_id: int,
+    steam_id: str,
+    interval_seconds: int,
+) -> bool:
+    cursor = await db.execute(
+        "UPDATE targets SET interval_seconds = ? WHERE telegram_id = ? AND steam_id = ?",
+        (interval_seconds, telegram_id, steam_id),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def is_steam_profile_blacklisted(db: aiosqlite.Connection, steam_id: str) -> bool:
+    async with db.execute(
+        "SELECT 1 FROM steam_profile_blacklist WHERE steam_id = ?",
+        (steam_id,),
+    ) as cur:
+        return await cur.fetchone() is not None
+
+
+async def get_steam_profile_blacklist_entry(
+    db: aiosqlite.Connection,
+    steam_id: str,
+) -> Optional[SteamProfileBlacklistEntry]:
+    async with db.execute(
+        "SELECT steam_id, reason, created_at, created_by "
+        "FROM steam_profile_blacklist WHERE steam_id = ?",
+        (steam_id,),
+    ) as cur:
+        row = await cur.fetchone()
+        if row is None:
+            return None
+        return SteamProfileBlacklistEntry(
+            steam_id=row[0],
+            reason=row[1],
+            created_at=row[2],
+            created_by=row[3],
+        )
+
+
+async def add_steam_profile_blacklist_entry(
+    db: aiosqlite.Connection,
+    entry: SteamProfileBlacklistEntry,
+) -> None:
+    await db.execute(
+        "INSERT INTO steam_profile_blacklist (steam_id, reason, created_at, created_by) "
+        "VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(steam_id) DO UPDATE SET "
+        "reason = excluded.reason, "
+        "created_at = excluded.created_at, "
+        "created_by = excluded.created_by",
+        (entry.steam_id, entry.reason, entry.created_at, entry.created_by),
+    )
+    await db.commit()
+
+
+async def remove_steam_profile_blacklist_entry(
+    db: aiosqlite.Connection,
+    steam_id: str,
+) -> bool:
+    cursor = await db.execute(
+        "DELETE FROM steam_profile_blacklist WHERE steam_id = ?",
+        (steam_id,),
+    )
+    await db.commit()
+    return cursor.rowcount > 0
+
+
+async def deactivate_targets_by_steam_id(
+    db: aiosqlite.Connection,
+    steam_id: str,
+) -> int:
+    cursor = await db.execute(
+        "UPDATE targets SET active = 0 WHERE steam_id = ? AND active != 0",
+        (steam_id,),
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 # ── TargetState CRUD ───────────────────────────────────────────────────

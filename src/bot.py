@@ -20,7 +20,7 @@ from .config import (
     CHECK_MIN_INTERVAL_SEC,
 )
 from .formatting import format_duration_seconds
-from .models import Target, TargetState, UserSettings
+from .models import Target, TargetState, UserSettings, SteamProfileBlacklistEntry
 from .steam import SteamClient, state_name, format_last_seen
 from .cs2_activity import CS2ActivityResolver, format_cs2_activity_lines
 
@@ -84,6 +84,16 @@ STEAM_URL_RE = re.compile(
 
 # Per-user pending states for button-driven flows
 _pending_add: Dict[int, bool] = {}
+_pending_rename: Dict[int, int] = {}
+
+INTERVAL_PRESETS = [60, 180, 300, 600, 900]
+_INTERVAL_LABELS = {
+    60: "1 мин",
+    180: "3 мин",
+    300: "5 мин",
+    600: "10 мин",
+    900: "15 мин",
+}
 
 # Common timezones offered in the settings picker. Stdlib zoneinfo names.
 TIMEZONES = [
@@ -119,17 +129,17 @@ def _help_text() -> str:
         "Steam Watcher — мониторинг Steam-профилей\n"
         "\n"
         "Что отслеживает: онлайн, игры, невидимку, смену ника и приватность.\n"
-        "Проверка: каждые 30 сек.\n"
+        "Проверка: каждые 30 сек по умолчанию, но для каждого профиля можно выбрать свой интервал.\n"
         "\n"
         "Как начать:\n"
         "1. Если нужно, сохрани свой ключ: /setkey КЛЮЧ\n"
         "2. Нажми ➕ Добавить и пришли ссылку на профиль Steam\n"
+        "3. Открой 📋 Мой список и управляй профилем кнопками\n"
         "\n"
-        "Основные команды:\n"
-        "/add ссылка — добавить профиль\n"
-        "/list — открыть список профилей\n"
-        "/check ссылка — проверить профиль сейчас\n"
-        "/setkey КЛЮЧ — сохранить свой Steam API ключ\n"
+        "Главное:\n"
+        "- добавить профиль — через ➕ Добавить\n"
+        "- проверить сейчас — через 🔍 Проверить\n"
+        "- сменить имя, интервал и blacklist — с карточки профиля\n"
         "\n"
         "Вместо ссылки можно писать SteamID64 (17 цифр).\n"
         "Профиль должен быть Public."
@@ -171,6 +181,10 @@ def _is_cancel_text(text: str) -> bool:
     return normalized in {"отмена", "cancel", "/cancel"}
 
 
+def _format_interval_label(seconds: int) -> str:
+    return _INTERVAL_LABELS.get(seconds, f"{seconds} сек")
+
+
 def render_target_card(target: Target, state: Optional[TargetState]) -> str:
     """Render the one-line 'name [marker]: status' target card.
 
@@ -195,18 +209,40 @@ def render_target_card(target: Target, state: Optional[TargetState]) -> str:
 def _build_target_keyboard(target: Target) -> types.InlineKeyboardMarkup:
     """Build inline keyboard for a single target."""
     builder = InlineKeyboardBuilder()
-    # Row 1: pause/resume + stats + session (3 buttons)
     if target.active:
         builder.button(text="⏸ Пауза", callback_data=f"pause:{target.id}")
     else:
         builder.button(text="▶️ Возобновить", callback_data=f"resume:{target.id}")
     builder.button(text="📜 История", callback_data=f"consistency:{target.id}")
     builder.button(text="⏱ Сессия", callback_data=f"session:{target.id}")
-    # Row 2: notification settings + delete + check (3 buttons)
-    builder.button(text="⚙️ Уведомления", callback_data=f"tset:{target.id}")
-    builder.button(text="🗑 Удалить", callback_data=f"remove:{target.id}")
+    builder.button(text="⏱ Интервал", callback_data=f"interval:{target.id}")
+    builder.button(text="📝 Переименовать", callback_data=f"rename_prompt:{target.id}")
     builder.button(text="🔍 Проверить", callback_data=f"check:{target.id}")
-    builder.adjust(3, 3)
+    builder.button(text="⚙️ Уведомления", callback_data=f"tset:{target.id}")
+    builder.button(text="🚫 В блэклист", callback_data=f"blacklist:{target.id}")
+    builder.button(text="🗑 Удалить", callback_data=f"remove:{target.id}")
+    builder.adjust(3, 3, 3)
+    return builder.as_markup()
+
+
+def _build_interval_picker_keyboard(target_id: int, current_interval: int) -> types.InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    for seconds in INTERVAL_PRESETS:
+        marker = "✅ " if seconds == current_interval else ""
+        builder.button(
+            text=f"{marker}{_format_interval_label(seconds)}",
+            callback_data=f"interval_pick:{target_id}:{seconds}",
+        )
+    builder.button(text="🔙 Назад", callback_data=f"interval_back:{target_id}")
+    builder.adjust(2, 2, 1, 1)
+    return builder.as_markup()
+
+
+def _build_blacklist_confirm_keyboard(target_id: int) -> types.InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🚫 Да, в блэклист", callback_data=f"blacklist_confirm:{target_id}")
+    builder.button(text="❌ Отмена", callback_data=f"blacklist_cancel:{target_id}")
+    builder.adjust(1, 1)
     return builder.as_markup()
 
 
@@ -411,6 +447,10 @@ def setup_bot(
                 await message.answer("Не удалось найти профиль по этой ссылке. Проверь, нет ли опечатки.")
                 return
 
+        if await db.is_steam_profile_blacklisted(db_conn, steam_id):
+            await message.answer("Этот профиль запрещён для мониторинга.")
+            return
+
         # Fetch profile to get nickname
         profile = await steam_client.get_player_summaries(api_key, steam_id)
         if profile is None:
@@ -436,8 +476,8 @@ def setup_bot(
                 f"Добавлен: {name}\n"
                 f"SteamID: {steam_id}\n"
                 f"Статус: {state_name(profile.persona_state)}\n"
-                f"Мониторинг каждые 30 сек.\n"
-                "Дальше можешь открыть список через /list или кнопку ниже."
+                f"Мониторинг: {_format_interval_label(DEFAULT_POLL_INTERVAL)}.\n"
+                "Дальше можешь открыть список кнопкой «📋 Мой список»."
             )
         except Exception as e:
             logger.error("Failed to add target: %s", e)
@@ -626,6 +666,25 @@ def setup_bot(
         user_id = message.from_user.id
         input_text = message.text.strip()
 
+        if user_id in _pending_rename:
+            target_id = _pending_rename.pop(user_id)
+            if _is_cancel_text(input_text):
+                await message.answer("Переименование отменено.")
+                return
+            if not input_text:
+                await message.answer("Имя не должно быть пустым.")
+                return
+            target = await _get_target_by_id(db_conn, user_id, target_id)
+            if not target:
+                await message.answer("Не найден.")
+                return
+            updated = await db.rename_target(db_conn, user_id, target.steam_id, input_text)
+            if not updated:
+                await message.answer("Не найден.")
+                return
+            await message.answer(f"Новое имя: {input_text}")
+            return
+
         # Steam add flow
         if _pending_add.get(user_id):
             _pending_add.pop(user_id, None)
@@ -679,6 +738,121 @@ def setup_bot(
         keyboard = _build_target_keyboard(target)
         state = await db.get_target_state(db_conn, target.id)
         text = render_target_card(target, state)
+        await callback.message.edit_text(text, reply_markup=keyboard)
+
+    @router.callback_query(F.data.startswith("interval:"))
+    async def cb_interval(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
+        await callback.answer()
+        keyboard = _build_interval_picker_keyboard(target.id, target.interval_seconds)
+        await callback.message.edit_text(
+            f"⏱ Интервал для {target.name}: { _format_interval_label(target.interval_seconds) }",
+            reply_markup=keyboard,
+        )
+
+    @router.callback_query(F.data.startswith("interval_pick:"))
+    async def cb_interval_pick(callback: CallbackQuery) -> None:
+        parts = callback.data.split(":")
+        target_id = int(parts[1])
+        interval_seconds = int(parts[2])
+        if interval_seconds not in INTERVAL_PRESETS:
+            await callback.answer("Неизвестный интервал.", show_alert=True)
+            return
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+
+        updated = await db.set_target_interval(db_conn, callback.from_user.id, target.steam_id, interval_seconds)
+        if not updated:
+            await callback.answer("Не удалось обновить интервал.", show_alert=True)
+            return
+        target.interval_seconds = interval_seconds
+        await callback.answer(f"Интервал: {_format_interval_label(interval_seconds)}")
+        state = await db.get_target_state(db_conn, target.id)
+        text = render_target_card(target, state)
+        keyboard = _build_target_keyboard(target)
+        await callback.message.edit_text(text, reply_markup=keyboard)
+
+    @router.callback_query(F.data.startswith("interval_back:"))
+    async def cb_interval_back(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+        state = await db.get_target_state(db_conn, target.id)
+        text = render_target_card(target, state)
+        keyboard = _build_target_keyboard(target)
+        await callback.message.edit_text(text, reply_markup=keyboard)
+
+    @router.callback_query(F.data.startswith("rename_prompt:"))
+    async def cb_rename_prompt(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+        _pending_rename[callback.from_user.id] = target.id
+        await callback.answer("Жду новое имя.")
+        await callback.message.answer(
+            f"Пришли новое имя для {target.name} (или напиши «Отмена»).",
+            reply_markup=ForceReply(selective=True),
+        )
+
+    @router.callback_query(F.data.startswith("blacklist:"))
+    async def cb_blacklist(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+        await callback.answer()
+        await callback.message.edit_text(
+            f"Добавить профиль {target.name} в блэклист?",
+            reply_markup=_build_blacklist_confirm_keyboard(target.id),
+        )
+
+    @router.callback_query(F.data.startswith("blacklist_confirm:"))
+    async def cb_blacklist_confirm(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+        if await db.is_steam_profile_blacklisted(db_conn, target.steam_id):
+            await callback.answer("Профиль уже в блэклисте.")
+            await callback.message.edit_text("Профиль уже в блэклисте.")
+            return
+        entry = SteamProfileBlacklistEntry(
+            steam_id=target.steam_id,
+            reason=f"blocked by telegram user {callback.from_user.id}",
+            created_at=int(time.time()),
+            created_by=callback.from_user.id,
+        )
+        await db.add_steam_profile_blacklist_entry(db_conn, entry)
+        changed = await db.deactivate_targets_by_steam_id(db_conn, target.steam_id)
+        await callback.answer("Добавлен в блэклист.")
+        await callback.message.edit_text(
+            f"Профиль добавлен в блэклист. Активные наблюдения отключены: {changed}."
+        )
+
+    @router.callback_query(F.data.startswith("blacklist_cancel:"))
+    async def cb_blacklist_cancel(callback: CallbackQuery) -> None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+        if not target:
+            await callback.answer("Не найден.", show_alert=True)
+            return
+        await callback.answer("Отменено.")
+        state = await db.get_target_state(db_conn, target.id)
+        text = render_target_card(target, state)
+        keyboard = _build_target_keyboard(target)
         await callback.message.edit_text(text, reply_markup=keyboard)
 
     @router.callback_query(F.data.startswith("remove:"))

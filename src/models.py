@@ -19,6 +19,14 @@ class Target:
 
 
 @dataclass
+class SteamProfileBlacklistEntry:
+    steam_id: str
+    reason: Optional[str] = None
+    created_at: int = 0
+    created_by: Optional[int] = None
+
+
+@dataclass
 class TargetState:
     target_id: int
     persona_state: int = 0

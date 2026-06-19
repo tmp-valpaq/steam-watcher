@@ -12,10 +12,17 @@ from src.db import (
     get_active_targets,
     set_target_active,
     set_all_targets_active,
+    set_target_interval,
+    rename_target,
+    is_steam_profile_blacklisted,
+    get_steam_profile_blacklist_entry,
+    add_steam_profile_blacklist_entry,
+    remove_steam_profile_blacklist_entry,
+    deactivate_targets_by_steam_id,
     get_target_state,
     save_target_state,
 )
-from src.models import User, Target, TargetState
+from src.models import User, Target, TargetState, SteamProfileBlacklistEntry
 
 
 @pytest.mark.asyncio
@@ -139,6 +146,82 @@ class TestTargetCRUD:
         targets = await get_targets(db_conn, 111)
         assert len(targets) == 2
         assert all(t.active is False for t in targets)
+
+    async def test_set_target_interval_updates_only_owned_target(self, db_conn):
+        await save_user(db_conn, User(telegram_id=111, steam_api_key="key"))
+        await save_user(db_conn, User(telegram_id=222, steam_api_key="key2"))
+        await add_target(db_conn, Target(id=0, telegram_id=111, steam_id="111", name="A", interval_seconds=30))
+        await add_target(db_conn, Target(id=0, telegram_id=222, steam_id="111", name="A2", interval_seconds=30))
+
+        updated = await set_target_interval(db_conn, 111, "111", 600)
+        assert updated is True
+
+        user_one_targets = await get_targets(db_conn, 111)
+        user_two_targets = await get_targets(db_conn, 222)
+        assert user_one_targets[0].interval_seconds == 600
+        assert user_two_targets[0].interval_seconds == 30
+
+    async def test_rename_target_updates_name(self, db_conn):
+        await save_user(db_conn, User(telegram_id=111, steam_api_key="key"))
+        await add_target(db_conn, Target(id=0, telegram_id=111, steam_id="111", name="Old"))
+
+        renamed = await rename_target(db_conn, 111, "111", "New")
+        assert renamed is True
+
+        targets = await get_targets(db_conn, 111)
+        assert targets[0].name == "New"
+
+
+@pytest.mark.asyncio
+class TestSteamProfileBlacklistCRUD:
+    async def test_blacklist_is_empty_by_default(self, db_conn):
+        assert await is_steam_profile_blacklisted(db_conn, "76561198000000001") is False
+        assert await get_steam_profile_blacklist_entry(db_conn, "76561198000000001") is None
+
+    async def test_add_and_get_blacklist_entry(self, db_conn):
+        entry = SteamProfileBlacklistEntry(
+            steam_id="76561198000000001",
+            reason="manual block",
+            created_at=1710000000,
+            created_by=111,
+        )
+
+        await add_steam_profile_blacklist_entry(db_conn, entry)
+
+        assert await is_steam_profile_blacklisted(db_conn, entry.steam_id) is True
+        fetched = await get_steam_profile_blacklist_entry(db_conn, entry.steam_id)
+        assert fetched is not None
+        assert fetched.steam_id == entry.steam_id
+        assert fetched.reason == "manual block"
+        assert fetched.created_at == 1710000000
+        assert fetched.created_by == 111
+
+    async def test_remove_blacklist_entry(self, db_conn):
+        entry = SteamProfileBlacklistEntry(
+            steam_id="76561198000000001",
+            created_at=1710000000,
+        )
+        await add_steam_profile_blacklist_entry(db_conn, entry)
+
+        removed = await remove_steam_profile_blacklist_entry(db_conn, entry.steam_id)
+        assert removed is True
+        assert await is_steam_profile_blacklisted(db_conn, entry.steam_id) is False
+
+    async def test_deactivate_targets_by_steam_id(self, db_conn):
+        await save_user(db_conn, User(telegram_id=111, steam_api_key="key"))
+        await save_user(db_conn, User(telegram_id=222, steam_api_key="key2"))
+        await add_target(db_conn, Target(id=0, telegram_id=111, steam_id="111", name="A", active=True))
+        await add_target(db_conn, Target(id=0, telegram_id=222, steam_id="111", name="B", active=True))
+        await add_target(db_conn, Target(id=0, telegram_id=222, steam_id="222", name="C", active=True))
+
+        changed = await deactivate_targets_by_steam_id(db_conn, "111")
+        assert changed == 2
+
+        user_one_targets = await get_targets(db_conn, 111)
+        user_two_targets = await get_targets(db_conn, 222)
+        assert user_one_targets[0].active is False
+        assert user_two_targets[0].active is False
+        assert user_two_targets[1].active is True
 
 
 @pytest.mark.asyncio

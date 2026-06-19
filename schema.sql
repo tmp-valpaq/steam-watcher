@@ -71,3 +71,10 @@ CREATE TABLE IF NOT EXISTS activity_log (
     FOREIGN KEY (target_id) REFERENCES targets(id)
 );
 CREATE INDEX IF NOT EXISTS idx_activity_log_target ON activity_log(target_id, detected_at DESC);
+
+CREATE TABLE IF NOT EXISTS steam_profile_blacklist (
+    steam_id TEXT PRIMARY KEY,
+    reason TEXT,
+    created_at INTEGER NOT NULL,
+    created_by INTEGER
+);

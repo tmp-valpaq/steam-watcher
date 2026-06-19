@@ -1,6 +1,8 @@
 """Focused tests for Telegram bot UX helpers."""
 
 from src.bot import (
+    _build_blacklist_confirm_keyboard,
+    _build_interval_picker_keyboard,
     _build_remove_confirm_keyboard,
     _build_settings_keyboard,
     _build_target_keyboard,
@@ -49,7 +51,28 @@ def test_target_keyboard_uses_clearer_labels():
     rows = _flatten_button_rows(markup)
 
     assert rows[0] == ["⏸ Пауза", "📜 История", "⏱ Сессия"]
-    assert rows[1] == ["⚙️ Уведомления", "🗑 Удалить", "🔍 Проверить"]
+    assert rows[1] == ["⏱ Интервал", "📝 Переименовать", "🔍 Проверить"]
+    assert rows[2] == ["⚙️ Уведомления", "🚫 В блэклист", "🗑 Удалить"]
+
+
+def test_interval_picker_marks_current_value():
+    markup = _build_interval_picker_keyboard(42, 300)
+    rows = _flatten_button_rows(markup)
+
+    assert rows[0] == ["1 мин", "3 мин"]
+    assert rows[1] == ["✅ 5 мин", "10 мин"]
+    assert rows[2] == ["15 мин"]
+    assert rows[3] == ["🔙 Назад"]
+
+
+def test_blacklist_confirm_keyboard_has_safe_choices():
+    markup = _build_blacklist_confirm_keyboard(42)
+
+    buttons = [(button.text, button.callback_data) for row in markup.inline_keyboard for button in row]
+    assert buttons == [
+        ("🚫 Да, в блэклист", "blacklist_confirm:42"),
+        ("❌ Отмена", "blacklist_cancel:42"),
+    ]
 
 
 def test_remove_confirm_keyboard_has_safe_choices():
