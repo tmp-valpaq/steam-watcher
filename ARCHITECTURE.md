@@ -35,12 +35,13 @@ Steam Watcher — single-process Telegram бот для мониторинга S
 
 ## Data Flow
 
-1. **Добавление таргета** — `/add ссылка` → bot.py резолвит vanity URL → берёт ник из Steam → сохраняет в db.py
+1. **Добавление таргета** — `/add ссылка` или кнопка `➕ Добавить` → bot.py резолвит vanity URL → проверяет глобальный blacklist → берёт ник из Steam → сохраняет в db.py
 2. **Поллинг** — watcher.py каждые 10с забирает все активные таргеты из db.py, группирует по API ключу, batch-запрос к Steam API
 3. **Алерты** — watcher.py сравнивает текущий стейт с предыдущим → генерирует алерты → шлёт через bot.send_message
 4. **Состояние** — каждый чек обновляет target_state в db.py (persona_state, current_game, playtimes)
 5. **Activity log** — каждое событие логируется в activity_log (batch insert, один commit)
 6. **Match polling** — каждые 5 мин OpenDota опрашивается для offline-таргетов (детект скрытых Dota 2 матчей)
+7. **Operator controls** — кнопки на карточке таргета меняют интервал поллинга, локальное имя, per-target алерты и могут глобально заблокировать SteamID через blacklist
 
 ## Invisible Detection
 
@@ -88,7 +89,7 @@ In-memory кеши в Watcher для минимизации API-вызовов:
 - `PERSONA_STATES`, `VISIBILITY_STATES` — мапы статусов
 
 ### models.py
-Dataclasses: `User`, `Target`, `TargetState`, `Alert`, `SteamProfile`, `MatchInfo`, `UserSettings`. Чистые данные, без логики.
+Dataclasses: `User`, `Target`, `SteamProfileBlacklistEntry`, `TargetState`, `Alert`, `SteamProfile`, `MatchInfo`, `UserSettings`. Чистые данные, без логики.
 
 ### steam.py
 - `SteamClient` — обёртка над `aiohttp.ClientSession`, batch API support
@@ -98,8 +99,10 @@ Dataclasses: `User`, `Target`, `TargetState`, `Alert`, `SteamProfile`, `MatchInf
 
 ### db.py
 - Один `aiosqlite.Connection`, передаётся через DI
-- CRUD для users, targets, target_states, user_settings, target_settings
+- CRUD для users, targets, target_states, user_settings, target_settings, steam_profile_blacklist
 - `get_target_by_id()` — прямой запрос по ID + ownership check (не N+1)
+- `set_target_interval()` — ownership-scoped update per target
+- `deactivate_targets_by_steam_id()` — глобально выключает мониторинг blacklisted SteamID
 - `save_activity_batch()` — batch insert для activity_log
 - `cleanup_activity_log()` — удаление старых записей
 - Schema migration: auto-add missing columns при init
@@ -119,7 +122,10 @@ Dataclasses: `User`, `Target`, `TargetState`, `Alert`, `SteamProfile`, `MatchInf
 ### bot.py
 - aiogram 3.x router с хендлерами команд и inline-кнопок
 - Bottom menu: ➕ Добавить, 📋 Мой список, 🔍 Проверить, ⚙️ Настройки
-- Inline кнопки на таргетах: Пауза, Консистентность, Сессия, Алерты, Удалить, Проверить
+- Inline кнопки на таргетах: Пауза, История, Сессия, Интервал, Переименовать, Уведомления, В блэклист, Удалить, Проверить
+- `⏱ Интервал` — пер-target poll cadence presets (`1 / 3 / 5 / 10 / 15 мин`)
+- `📝 Переименовать` — guided rename flow через pending state
+- `🚫 В блэклист` — confirm flow, после которого новые add blocked, а существующие таргеты деактивируются
 - Settings panel: сводка, время сводки, timezone, сессии, приватность
 - Per-target alert settings: 7 типов алертов вкл/выкл
 - `_parse_steam_input()` — парсит URL / SteamID64 / vanity name
@@ -151,7 +157,8 @@ Dataclasses: `User`, `Target`, `TargetState`, `Alert`, `SteamProfile`, `MatchInf
 - **30-day activity retention** — автоочистка, таблица не растёт бесконечно
 - **URL вместо SteamID64** — простота для обычных юзеров
 - **Авто-ник из Steam** — не заставлять придумывать имена
-- **30 сек интервал** — баланс между скоростью и лимитами API
+- **30 сек интервал по умолчанию** — баланс между скоростью и лимитами API; при этом конкретный таргет можно замедлить или ускорить кнопкой
+- **Глобальный blacklist SteamID** — безопаснее блокировать добавление и деактивировать живые наблюдения, чем удалять исторические записи
 
 ## Scalability
 
