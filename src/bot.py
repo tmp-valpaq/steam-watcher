@@ -4,6 +4,7 @@ import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from aiogram import Bot, BaseMiddleware, Dispatcher, Router, types, F
 from aiogram.filters import CommandStart, Command
@@ -279,6 +280,58 @@ def _build_target_keyboard(target: Target) -> types.InlineKeyboardMarkup:
     builder.button(text="🗑 Удалить", callback_data=f"remove:{target.id}")
     builder.adjust(3, 3, 3)
     return builder.as_markup()
+
+
+def _format_last_game_activity_time(ts: int, tz_name: str) -> str:
+    try:
+        tz = ZoneInfo(tz_name or "UTC")
+    except ZoneInfoNotFoundError:
+        tz = ZoneInfo("UTC")
+
+    dt_local = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(tz)
+    now_local = datetime.now(tz=timezone.utc).astimezone(tz)
+    if dt_local.date() == now_local.date():
+        return dt_local.strftime("%H:%M")
+    return dt_local.strftime("%Y-%m-%d %H:%M")
+
+
+async def _append_last_game_observed_lines(
+    lines: list[str],
+    db_conn: aiosqlite.Connection,
+    telegram_id: int,
+    target: Target,
+    profile,
+    target_state: Optional[TargetState],
+) -> None:
+    """Add exact monitored last-game time when watcher actually observed it."""
+    game_name = None
+    detected_at = None
+
+    if profile.game_name and target_state and target_state.game_start_time:
+        game_name = profile.game_name
+        detected_at = target_state.game_start_time
+    else:
+        activity = await db.get_activity_log(
+            db_conn,
+            target.id,
+            limit=5,
+            event_types=["game_start", "game_stop", "invisible"],
+        )
+        for entry in activity:
+            if entry.get("game_name") and entry.get("detected_at"):
+                game_name = entry["game_name"]
+                detected_at = entry["detected_at"]
+                break
+
+    if not game_name or not detected_at:
+        return
+
+    lines[:] = [line for line in lines if not line.startswith("Недавняя игра:")]
+
+    settings = await db.get_user_settings(db_conn, telegram_id)
+    tz_name = settings.timezone if settings else "UTC"
+    lines.append(f"Последний раз: {game_name}")
+    lines.append(f"В {_format_last_game_activity_time(detected_at, tz_name)}")
 
 
 def _build_interval_picker_keyboard(target_id: int, current_interval: int) -> types.InlineKeyboardMarkup:
@@ -1024,6 +1077,7 @@ def setup_bot(
 
         state = await db.get_target_state(db_conn, target.id)
         lines = await _build_check_lines(steam_client, api_key, profile, target.steam_id, state)
+        await _append_last_game_observed_lines(lines, db_conn, callback.from_user.id, target, profile, state)
         await _append_cs2_activity(lines, target.steam_id)
 
         await callback.message.answer("\n".join(lines))
@@ -1056,6 +1110,7 @@ def setup_bot(
 
         state = await db.get_target_state(db_conn, target.id)
         lines = await _build_check_lines(steam_client, api_key, profile, target.steam_id, state)
+        await _append_last_game_observed_lines(lines, db_conn, callback.from_user.id, target, profile, state)
         await _append_cs2_activity(lines, target.steam_id)
 
         await callback.message.edit_text("\n".join(lines))

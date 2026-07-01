@@ -6,6 +6,7 @@ import pytest
 
 from src import bot as bot_module
 from src.bot import (
+    _append_last_game_observed_lines,
     _build_blacklist_confirm_keyboard,
     _build_check_lines,
     _build_interval_picker_keyboard,
@@ -228,6 +229,45 @@ async def test_build_check_lines_online_idle_prefers_live_recent_games_over_stal
         "Player",
         "Статус: Online 🟢",
         "Недавняя игра: Live Recent Game",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_append_last_game_observed_lines_replaces_recent_game_with_exact_time(monkeypatch):
+    async def fake_get_activity_log(db_conn, target_id, limit=20, event_types=None):
+        return [{"game_name": "Observed Game", "detected_at": 1_700_000_000}]
+
+    async def fake_get_user_settings(db_conn, telegram_id):
+        return UserSettings(telegram_id=telegram_id, timezone="UTC")
+
+    monkeypatch.setattr(bot_module.db, "get_activity_log", fake_get_activity_log)
+    monkeypatch.setattr(bot_module.db, "get_user_settings", fake_get_user_settings)
+    monkeypatch.setattr(
+        bot_module,
+        "datetime",
+        SimpleNamespace(
+            fromtimestamp=lambda ts, tz=None: __import__("datetime").datetime.fromtimestamp(ts, tz=tz),
+            now=lambda tz=None: __import__("datetime").datetime.fromtimestamp(1_700_000_120, tz=tz),
+        ),
+    )
+
+    lines = [
+        "Player",
+        "Статус: Offline 🔴",
+        "Последний онлайн: 2026-01-01 00:00 UTC",
+        "Недавняя игра: Stale Hint",
+    ]
+    target = Target(id=7, telegram_id=1, steam_id="7656", name="Player")
+    profile = SteamProfile(steam_id="7656", persona_name="Player", persona_state=0)
+
+    await _append_last_game_observed_lines(lines, None, 1, target, profile, None)
+
+    assert lines == [
+        "Player",
+        "Статус: Offline 🔴",
+        "Последний онлайн: 2026-01-01 00:00 UTC",
+        "Последний раз: Observed Game",
+        "В 22:13",
     ]
 
 
