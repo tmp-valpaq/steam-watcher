@@ -58,6 +58,28 @@ async def init_db(db: aiosqlite.Connection) -> None:
             await cur.execute(
                 "ALTER TABLE target_states ADD COLUMN playtime_unit_version INTEGER"
             )
+        await cur.execute(
+            """
+            UPDATE target_states
+            SET last_observed_game_name = COALESCE(last_observed_game_name, (
+                    SELECT a.game_name
+                    FROM activity_log a
+                    WHERE a.target_id = target_states.target_id
+                      AND a.game_name IS NOT NULL
+                    ORDER BY a.detected_at DESC
+                    LIMIT 1
+                )),
+                last_observed_game_time = COALESCE(last_observed_game_time, (
+                    SELECT a.detected_at
+                    FROM activity_log a
+                    WHERE a.target_id = target_states.target_id
+                      AND a.game_name IS NOT NULL
+                    ORDER BY a.detected_at DESC
+                    LIMIT 1
+                ))
+            WHERE last_observed_game_name IS NULL OR last_observed_game_time IS NULL
+            """
+        )
 
         # Migrate user_settings: add timezone column if missing
         await cur.execute("PRAGMA table_info(user_settings)")

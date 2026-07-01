@@ -378,6 +378,80 @@ class TestLegacyPlaytimeMigration:
                 2,
             )
 
+    async def test_init_db_backfills_durable_last_observed_game_from_activity_log(self, tmp_path):
+        import aiosqlite
+
+        db_path = tmp_path / "backfill.db"
+        async with aiosqlite.connect(db_path) as conn:
+            await conn.executescript(
+                """
+                CREATE TABLE users (
+                    telegram_id INTEGER PRIMARY KEY,
+                    steam_api_key TEXT NOT NULL
+                );
+                CREATE TABLE targets (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL,
+                    steam_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    interval_seconds INTEGER NOT NULL DEFAULT 30,
+                    active INTEGER NOT NULL DEFAULT 1,
+                    UNIQUE(telegram_id, steam_id)
+                );
+                CREATE TABLE target_states (
+                    target_id INTEGER PRIMARY KEY,
+                    persona_state INTEGER,
+                    persona_name TEXT,
+                    game_id TEXT,
+                    game_name TEXT,
+                    playtime_forever INTEGER,
+                    last_logoff INTEGER,
+                    last_checked INTEGER,
+                    last_match_id TEXT,
+                    last_match_time INTEGER,
+                    game_playtimes TEXT,
+                    visibility_state INTEGER,
+                    game_start_time INTEGER,
+                    last_session_update INTEGER,
+                    daily_playtime_snapshot TEXT,
+                    playtime_unit_version INTEGER NOT NULL DEFAULT 2,
+                    FOREIGN KEY (target_id) REFERENCES targets(id)
+                );
+                CREATE TABLE activity_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    game_name TEXT,
+                    match_id TEXT,
+                    hero_name TEXT,
+                    duration_seconds INTEGER,
+                    details TEXT,
+                    detected_at INTEGER NOT NULL,
+                    FOREIGN KEY (target_id) REFERENCES targets(id)
+                );
+                """
+            )
+            await conn.execute(
+                "INSERT INTO targets (id, telegram_id, steam_id, name, interval_seconds, active) VALUES (?, ?, ?, ?, ?, ?)",
+                (1, 111, "76561198000000001", "Legacy", 30, 1),
+            )
+            await conn.execute(
+                "INSERT INTO target_states (target_id, persona_state, persona_name, last_checked, playtime_unit_version) VALUES (?, ?, ?, ?, ?)",
+                (1, 0, "Legacy", 1705320000, 2),
+            )
+            await conn.execute(
+                "INSERT INTO activity_log (target_id, event_type, game_name, detected_at) VALUES (?, ?, ?, ?)",
+                (1, "game_stop", "Dota 2", 1705319000),
+            )
+            await conn.commit()
+
+        async with aiosqlite.connect(db_path) as conn:
+            await init_db(conn)
+            state = await get_target_state(conn, 1)
+            assert state is not None
+            assert state.last_observed_game_name == "Dota 2"
+            assert state.last_observed_game_time == 1705319000
+
     async def test_malformed_legacy_playtime_map_stays_unmigrated(self, tmp_path):
         import aiosqlite
         import json
