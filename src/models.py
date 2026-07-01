@@ -46,6 +46,8 @@ class TargetState:
     game_start_time: Optional[int] = None
     last_session_update: Optional[int] = None
     daily_playtime_snapshot: Optional[str] = None
+    last_observed_game_name: Optional[str] = None
+    last_observed_game_time: Optional[int] = None
     # Migration/version marker for persisted playtime units.
     # 1 = legacy minutes, 2 = current seconds.
     playtime_unit_version: int = 2

@@ -240,6 +240,8 @@ class TestTargetStateCRUD:
             playtime_forever=42,
             last_logoff=1705319400,
             last_checked=1705320000,
+            last_observed_game_name="Counter-Strike 2",
+            last_observed_game_time=1705319000,
         )
         await save_target_state(db_conn, state)
 
@@ -249,6 +251,8 @@ class TestTargetStateCRUD:
         assert fetched.persona_name == "Player1"
         assert fetched.playtime_forever == 42
         assert fetched.last_logoff == 1705319400
+        assert fetched.last_observed_game_name == "Counter-Strike 2"
+        assert fetched.last_observed_game_time == 1705319000
 
     async def test_update_state(self, db_conn):
         await save_user(db_conn, User(telegram_id=111, steam_api_key="key"))

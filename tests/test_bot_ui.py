@@ -272,6 +272,45 @@ async def test_append_last_game_observed_lines_replaces_recent_game_with_exact_t
 
 
 @pytest.mark.asyncio
+async def test_append_last_game_observed_lines_uses_durable_state_before_activity_log(monkeypatch):
+    async def fake_get_user_settings(db_conn, telegram_id):
+        return UserSettings(telegram_id=telegram_id, timezone="UTC")
+
+    async def fake_get_activity_log(db_conn, target_id, limit=20, event_types=None):
+        return []
+
+    monkeypatch.setattr(bot_module.db, "get_user_settings", fake_get_user_settings)
+    monkeypatch.setattr(bot_module.db, "get_activity_log", fake_get_activity_log)
+    monkeypatch.setattr(
+        bot_module,
+        "datetime",
+        SimpleNamespace(
+            fromtimestamp=lambda ts, tz=None: __import__("datetime").datetime.fromtimestamp(ts, tz=tz),
+            now=lambda tz=None: __import__("datetime").datetime.fromtimestamp(1_700_000_120, tz=tz),
+        ),
+    )
+
+    lines = ["Player", "Статус: Offline 🔴"]
+    target = Target(id=7, telegram_id=1, steam_id="7656", name="Player")
+    profile = SteamProfile(steam_id="7656", persona_name="Player", persona_state=0)
+    target_state = TargetState(
+        target_id=7,
+        persona_state=0,
+        last_observed_game_name="Durable Game",
+        last_observed_game_time=1_700_000_000,
+    )
+
+    await _append_last_game_observed_lines(lines, None, 1, target, profile, target_state)
+
+    assert lines == [
+        "Player",
+        "Статус: Offline 🔴",
+        "Последний раз: Durable Game",
+        "В 22:13",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_show_session_info_missing_target_does_not_reanswer_callback(monkeypatch):
     calls = []
 

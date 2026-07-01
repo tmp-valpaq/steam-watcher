@@ -310,6 +310,9 @@ async def _append_last_game_observed_lines(
     if profile.game_name and target_state and target_state.game_start_time:
         game_name = profile.game_name
         detected_at = target_state.game_start_time
+    elif target_state and target_state.last_observed_game_name and target_state.last_observed_game_time:
+        game_name = target_state.last_observed_game_name
+        detected_at = target_state.last_observed_game_time
     else:
         activity = await db.get_activity_log(
             db_conn,

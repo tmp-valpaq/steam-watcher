@@ -323,7 +323,7 @@ class Watcher:
             if today != self._last_cleanup_date:
                 self._last_cleanup_date = today
                 try:
-                    deleted = await db.cleanup_activity_log(self._db, retention_days=30)
+                    deleted = await db.cleanup_activity_log(self._db, retention_days=180)
                     if deleted > 0:
                         logger.info("Cleaned up %d old activity_log entries", deleted)
                 except Exception as e:
@@ -437,14 +437,25 @@ class Watcher:
         # Determine game_start_time:
         # If target just started playing (new game, wasn't playing before), set start time
         game_start_time = previous_state.game_start_time if previous_state else None
+        last_observed_game_name = previous_state.last_observed_game_name if previous_state else None
+        last_observed_game_time = previous_state.last_observed_game_time if previous_state else None
         if resolved_game_name and profile.persona_state > 0:
             was_playing = previous_state and previous_state.game_name and previous_state.persona_state > 0
             if not was_playing or (previous_state and previous_state.game_name != resolved_game_name):
                 # New game session started
                 game_start_time = now
             # else: continuing same game, keep existing game_start_time
+            observed_at = game_start_time or now
+            last_observed_game_name = resolved_game_name
+            last_observed_game_time = observed_at
+        elif previous_state and previous_state.game_name and previous_state.game_start_time:
+            # Preserve the last completed observed session even after the user
+            # leaves the game/offline so manual checks can still show it long
+            # after activity_log cleanup.
+            last_observed_game_name = previous_state.game_name
+            last_observed_game_time = previous_state.game_start_time
         else:
-            # Not playing anymore, clear game_start_time (will be used for duration calc in alerts)
+            # Not playing anymore, keep the durable last observed game fields.
             pass
 
         # Initialize daily_playtime_snapshot if needed.
@@ -492,6 +503,8 @@ class Watcher:
             game_start_time=game_start_time,
             last_session_update=previous_state.last_session_update if previous_state else None,
             daily_playtime_snapshot=daily_playtime_snapshot,
+            last_observed_game_name=last_observed_game_name,
+            last_observed_game_time=last_observed_game_time,
         )
 
         prev_playtime = previous_state.playtime_forever if previous_state else None

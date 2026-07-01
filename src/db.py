@@ -42,6 +42,8 @@ async def init_db(db: aiosqlite.Connection) -> None:
         ("game_start_time", "INTEGER"),
         ("last_session_update", "INTEGER"),
         ("daily_playtime_snapshot", "TEXT"),
+        ("last_observed_game_name", "TEXT"),
+        ("last_observed_game_time", "INTEGER"),
     ]
     async with db.cursor() as cur:
         # Get existing columns
@@ -374,7 +376,8 @@ async def get_target_state(db: aiosqlite.Connection, target_id: int) -> Optional
         "SELECT target_id, persona_state, persona_name, game_id, game_name, "
         "playtime_forever, last_logoff, last_checked, last_match_id, last_match_time, "
         "game_playtimes, visibility_state, game_start_time, last_session_update, "
-        "daily_playtime_snapshot, playtime_unit_version "
+        "daily_playtime_snapshot, last_observed_game_name, last_observed_game_time, "
+        "playtime_unit_version "
         "FROM target_states WHERE target_id = ?",
         (target_id,),
     ) as cur:
@@ -382,7 +385,7 @@ async def get_target_state(db: aiosqlite.Connection, target_id: int) -> Optional
         if row is None:
             return None
         playtime_forever, game_playtimes, daily_snapshot, version = _normalize_legacy_playtime_payload(
-            row[5], row[10], row[14], row[15]
+            row[5], row[10], row[14], row[17]
         )
         return TargetState(
             target_id=row[0],
@@ -400,6 +403,8 @@ async def get_target_state(db: aiosqlite.Connection, target_id: int) -> Optional
             game_start_time=row[12],
             last_session_update=row[13],
             daily_playtime_snapshot=daily_snapshot,
+            last_observed_game_name=row[15],
+            last_observed_game_time=row[16],
             playtime_unit_version=version,
         )
 
@@ -410,8 +415,8 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
         "(target_id, persona_state, persona_name, game_id, game_name, "
         "playtime_forever, last_logoff, last_checked, last_match_id, last_match_time, "
         "game_playtimes, visibility_state, game_start_time, last_session_update, "
-        "daily_playtime_snapshot, playtime_unit_version) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "daily_playtime_snapshot, last_observed_game_name, last_observed_game_time, playtime_unit_version) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(target_id) DO UPDATE SET "
         "persona_state = excluded.persona_state, "
         "persona_name = excluded.persona_name, "
@@ -427,6 +432,8 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
         "game_start_time = excluded.game_start_time, "
         "last_session_update = excluded.last_session_update, "
         "daily_playtime_snapshot = excluded.daily_playtime_snapshot, "
+        "last_observed_game_name = excluded.last_observed_game_name, "
+        "last_observed_game_time = excluded.last_observed_game_time, "
         "playtime_unit_version = excluded.playtime_unit_version",
         (
             state.target_id,
@@ -444,6 +451,8 @@ async def save_target_state(db: aiosqlite.Connection, state: TargetState) -> Non
             state.game_start_time,
             state.last_session_update,
             state.daily_playtime_snapshot,
+            state.last_observed_game_name,
+            state.last_observed_game_time,
             state.playtime_unit_version,
         ),
     )
@@ -695,7 +704,7 @@ async def save_activity_batch(
 
 async def cleanup_activity_log(
     db: aiosqlite.Connection,
-    retention_days: int = 30,
+    retention_days: int = 180,
 ) -> int:
     """Delete activity_log entries older than retention_days. Returns count deleted."""
     cutoff = int(time.time()) - (retention_days * 86400)

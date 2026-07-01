@@ -588,6 +588,49 @@ class TestBlockedBotDeactivates:
         stored = await db.get_targets(db_conn, telegram_id)
         assert all(t.active is False for t in stored)
 
+    async def test_check_target_persists_durable_last_observed_game(self, db_conn, monkeypatch):
+        telegram_id = 2222
+        await db.save_user(db_conn, User(telegram_id=telegram_id, steam_api_key="k"))
+        target = await db.add_target(
+            db_conn,
+            Target(id=0, telegram_id=telegram_id, steam_id="76561198000000999", name="Durable", interval_seconds=30, active=True),
+        )
+
+        watcher = _make_watcher(db_conn, AsyncMock())
+        clock = {"now": 1_700_000_000}
+        monkeypatch.setattr("src.watcher.time.time", lambda: clock["now"])
+
+        start_profile = _make_state(game_id="730", game_name="Counter-Strike 2", persona_state=1)
+        await watcher._check_target("k", target, start_profile)
+
+        clock["now"] += 120
+        stop_profile = _make_state(game_id=None, game_name=None, persona_state=0)
+        await watcher._check_target("k", target, stop_profile)
+
+        state = await db.get_target_state(db_conn, target.id)
+        assert state.last_observed_game_name == "Counter-Strike 2"
+        assert state.last_observed_game_time == 1_700_000_000
+
+    async def test_cleanup_activity_log_defaults_to_180_days(self, db_conn, monkeypatch):
+        now = 1_800_000_000
+        monkeypatch.setattr("src.db.time.time", lambda: now)
+
+        await db.save_user(db_conn, User(telegram_id=3333, steam_api_key="k"))
+        target = await db.add_target(
+            db_conn,
+            Target(id=0, telegram_id=3333, steam_id="76561198000000888", name="Retention", interval_seconds=30, active=True),
+        )
+
+        await db.save_activity(db_conn, target.id, "game_stop", game_name="Old Game", detected_at=now - 181 * 86400)
+        await db.save_activity(db_conn, target.id, "game_stop", game_name="Kept Game", detected_at=now - 90 * 86400)
+
+        deleted = await db.cleanup_activity_log(db_conn)
+        assert deleted == 1
+
+        rows = await db.get_activity_log(db_conn, target.id, limit=10)
+        assert len(rows) == 1
+        assert rows[0]["game_name"] == "Kept Game"
+
     async def test_poll_all_skips_remaining_targets_for_user_after_block(self, db_conn):
         telegram_id = 777
         await db.save_user(db_conn, User(telegram_id=telegram_id, steam_api_key="k"))
