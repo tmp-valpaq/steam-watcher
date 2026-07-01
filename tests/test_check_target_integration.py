@@ -204,10 +204,10 @@ class TestDailySummaryAfterPlay:
         summaries = [m for tid, m in sent if tid == 777 and "Ежедневная сводка" in m]
         assert summaries, "expected a non-empty daily summary"
         body = summaries[0]
+        assert "TestUser" in body
         assert "Counter-Strike 2" in body
         # ~90 minutes accumulated (60 polls * 90s = 5400s) -> "1ч 30мин".
-        assert "Всего:" in body
-        assert "1ч 30мин" in body
+        assert "Всего: 1ч 30мин" in body
         # Snapshot must have been marked as sent for the user.
         settings = await db.get_user_settings(db_conn, 777)
         assert settings.last_summary_date != ""

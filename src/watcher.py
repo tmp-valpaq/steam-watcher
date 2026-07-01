@@ -677,8 +677,11 @@ class Watcher:
                     await db.mark_summary_sent(self._db, telegram_id, today_str)
                     continue
 
-                # Aggregate playtime across all active targets
-                aggregated: Dict[str, int] = {}  # game_name -> seconds played today
+                # Aggregate playtime per target so the midnight report keeps
+                # the nickname / player grouping instead of collapsing all
+                # games from all monitored profiles into one flat list.
+                per_target: list[tuple[str, Dict[str, int], int]] = []
+                overall_total = 0
 
                 for target in targets:
                     if not target.active:
@@ -703,15 +706,22 @@ class Watcher:
                         except (json.JSONDecodeError, TypeError):
                             snapshot_pts = {}
 
-                    # Calculate per-game delta
+                    # Calculate per-game delta for this target.
+                    target_games: Dict[str, int] = {}
                     for appid, playtime in current_pts.items():
                         prev = snapshot_pts.get(appid, 0)
                         delta = playtime - prev
                         if delta > 0:
                             game_name = _appid_to_name(appid, self._game_name_cache)
-                            aggregated[game_name] = aggregated.get(game_name, 0) + delta
+                            target_games[game_name] = target_games.get(game_name, 0) + delta
 
-                if not aggregated:
+                    if target_games:
+                        target_total = sum(target_games.values())
+                        display_name = (state.persona_name if state else None) or target.name
+                        per_target.append((display_name, target_games, target_total))
+                        overall_total += target_total
+
+                if not per_target:
                     # No playtime today, still mark as sent
                     await db.mark_summary_sent(self._db, telegram_id, today_str)
                     continue
@@ -719,13 +729,19 @@ class Watcher:
                 # Build summary message. Aggregated values are SECONDS; the
                 # formatter takes minutes, so convert at the boundary.
                 lines = ["📊 Ежедневная сводка", ""]
-                sorted_games = sorted(aggregated.items(), key=lambda x: x[1], reverse=True)
-                for game_name, seconds in sorted_games[:10]:
-                    lines.append(f"• {game_name}: {format_playtime_minutes(seconds // 60)}")
+                per_target.sort(key=lambda item: item[2], reverse=True)
+                for idx, (display_name, target_games, target_total) in enumerate(per_target):
+                    if idx > 0:
+                        lines.append("")
+                    lines.append(display_name)
+                    sorted_games = sorted(target_games.items(), key=lambda x: x[1], reverse=True)
+                    for game_name, seconds in sorted_games[:10]:
+                        lines.append(f"• {game_name}: {format_playtime_minutes(seconds // 60)}")
+                    lines.append(f"Всего: {format_playtime_minutes(target_total // 60)}")
 
-                total = sum(aggregated.values())
-                lines.append("")
-                lines.append(f"Всего: {format_playtime_minutes(total // 60)}")
+                if len(per_target) > 1:
+                    lines.append("")
+                    lines.append(f"Итого по всем: {format_playtime_minutes(overall_total // 60)}")
 
                 try:
                     await self._send_alert(telegram_id, "\n".join(lines))

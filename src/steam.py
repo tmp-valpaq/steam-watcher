@@ -163,6 +163,39 @@ class SteamClient:
             )
             return None
 
+    async def get_recently_played_games(
+        self, api_key: str, steam_id: str
+    ) -> List[str]:
+        """Return recently played game names for a Steam profile.
+
+        Steam's recently-played endpoint does not expose an exact last-played
+        timestamp, only a bounded list of games from the recent window. We use
+        it as a best-effort hint for the last visible game in manual checks.
+        """
+        url = f"{STEAM_API_BASE}/IPlayerService/GetRecentlyPlayedGames/v0001/"
+        params = {
+            "key": api_key,
+            "steamid": steam_id,
+            "format": "json",
+            "count": 3,
+        }
+        try:
+            data = await self._get(url, params, api_key=api_key)
+            games = data.get("response", {}).get("games", [])
+            names = []
+            for game in games:
+                name = game.get("name")
+                if name:
+                    names.append(name)
+            return names
+        except Exception as e:
+            logger.error(
+                "Failed to get recently played games for %s: %s",
+                steam_id,
+                _safe_error(e),
+            )
+            return []
+
     async def validate_key(self, api_key: str) -> bool:
         """Validate an API key by making a lightweight request."""
         url = f"{STEAM_API_BASE}/ISteamUser/GetPlayerSummaries/v0002/"

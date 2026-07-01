@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import re
 import time
@@ -94,6 +95,7 @@ _INTERVAL_LABELS = {
     600: "10 мин",
     900: "15 мин",
 }
+RECENT_GAMES_LOOKUP_TIMEOUT_SEC = 3.0
 
 # Common timezones offered in the settings picker. Stdlib zoneinfo names.
 TIMEZONES = [
@@ -185,6 +187,15 @@ def _format_interval_label(seconds: int) -> str:
     return _INTERVAL_LABELS.get(seconds, f"{seconds} сек")
 
 
+def _online_badge(persona_state: int) -> str:
+    """Manual check UI: green for any non-offline state, red for offline.
+
+    Product requirement here is binary presence signaling, not a separate color
+    palette for Busy/Away/Snooze.
+    """
+    return "🔴" if persona_state == 0 else "🟢"
+
+
 def render_target_card(target: Target, state: Optional[TargetState]) -> str:
     """Render the one-line 'name [marker]: status' target card.
 
@@ -204,6 +215,51 @@ def render_target_card(target: Target, state: Optional[TargetState]) -> str:
             status = "Ещё не проверен"
     marker = "активен" if target.active else "пауза"
     return f"{target.name} [{marker}]: {status}"
+
+
+async def _build_check_lines(
+    steam_client: SteamClient,
+    api_key: str,
+    profile,
+    steam_id: str,
+    target_state: Optional[TargetState] = None,
+) -> list[str]:
+    status = state_name(profile.persona_state)
+    lines = [
+        f"{profile.persona_name}",
+        f"Статус: {status} {_online_badge(profile.persona_state)}",
+    ]
+    if profile.game_name:
+        lines.append(f"Играет: {profile.game_name}")
+
+    if profile.persona_state == 0 and profile.last_logoff:
+        lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
+
+    recent_game = None
+    if not profile.game_name:
+        if (
+            profile.persona_state == 0
+            and target_state
+            and target_state.game_name
+            and target_state.persona_state <= 0
+        ):
+            recent_game = target_state.game_name
+        else:
+            try:
+                recent_games = await asyncio.wait_for(
+                    steam_client.get_recently_played_games(api_key, steam_id),
+                    timeout=RECENT_GAMES_LOOKUP_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                logger.debug("Recent games lookup timed out for %s", steam_id)
+                recent_games = []
+            except Exception:
+                recent_games = []
+            recent_game = recent_games[0] if recent_games else None
+    if recent_game:
+        lines.append(f"Недавняя игра: {recent_game}")
+
+    return lines
 
 
 def _build_target_keyboard(target: Target) -> types.InlineKeyboardMarkup:
@@ -278,6 +334,62 @@ def _build_settings_keyboard(settings: UserSettings) -> types.InlineKeyboardMark
 def _settings_panel_text(settings: UserSettings) -> str:
     """Header for the settings panel showing the active timezone."""
     return f"⚙️ Настройки ({settings.timezone}):"
+
+
+async def _show_session_info(
+    callback: CallbackQuery,
+    db_conn: aiosqlite.Connection,
+    target: Optional[Target] = None,
+) -> None:
+    """Render current session info for a target and always finish after callback ack.
+
+    Keep the Telegram callback acknowledgement separate from the message send so
+    the inline button spinner never hangs while we gather state and format the
+    response.
+    """
+    if target is None:
+        target_id = int(callback.data.split(":")[1])
+        target = await _get_target_by_id(db_conn, callback.from_user.id, target_id)
+    if not target:
+        return
+
+    state = await db.get_target_state(db_conn, target.id)
+
+    if not state:
+        await callback.message.answer(
+            f"⏱ {target.name}\n\nДанных пока нет. Подожди первую проверку."
+        )
+        return
+
+    is_playing = state.persona_state > 0 and state.game_name
+    name = state.persona_name or target.name
+
+    if is_playing:
+        lines = [f"⏱ {name}", "", f"Играет: {state.game_name}"]
+
+        if state.game_start_time:
+            now = int(datetime.now(tz=timezone.utc).timestamp())
+            elapsed = now - state.game_start_time
+            if elapsed > 0:
+                lines.append(f"Длительность сессии: {format_duration_seconds(elapsed)}")
+
+        if state.last_logoff:
+            lines.append(f"Последний выход: {format_last_seen(state.last_logoff)}")
+
+        await callback.message.answer("\n".join(lines))
+        return
+
+    lines = [f"⏱ {name}", ""]
+    status = state_name(state.persona_state)
+    lines.append(f"Статус: {status}")
+
+    if state.last_logoff:
+        lines.append(f"Последний онлайн: {format_last_seen(state.last_logoff)}")
+
+    if state.game_name:
+        lines.append(f"Последняя игра: {state.game_name}")
+
+    await callback.message.answer("\n".join(lines))
 
 
 def _build_time_picker_keyboard() -> types.InlineKeyboardMarkup:
@@ -577,17 +689,7 @@ def setup_bot(
             await message.answer("Профиль не найден или приватный.")
             return
 
-        status = state_name(profile.persona_state)
-        lines = [
-            f"{profile.persona_name}",
-            f"Статус: {status}",
-        ]
-        if profile.game_name:
-            lines.append(f"Играет: {profile.game_name}")
-        # last_logoff is the last LOGOFF time — only meaningful when the player
-        # is currently offline. Showing it for an online player is misleading.
-        if profile.persona_state == 0 and profile.last_logoff:
-            lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
+        lines = await _build_check_lines(steam_client, api_key, profile, steam_id)
         await _append_cs2_activity(lines, steam_id)
 
         await message.answer("\n".join(lines))
@@ -920,17 +1022,8 @@ def setup_bot(
             await callback.message.answer("Профиль не найден или приватный.")
             return
 
-        status = state_name(profile.persona_state)
-        lines = [
-            f"{profile.persona_name}",
-            f"Статус: {status}",
-        ]
-        if profile.game_name:
-            lines.append(f"Играет: {profile.game_name}")
-        # last_logoff is the last LOGOFF time — only meaningful when the player
-        # is currently offline. Showing it for an online player is misleading.
-        if profile.persona_state == 0 and profile.last_logoff:
-            lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
+        state = await db.get_target_state(db_conn, target.id)
+        lines = await _build_check_lines(steam_client, api_key, profile, target.steam_id, state)
         await _append_cs2_activity(lines, target.steam_id)
 
         await callback.message.answer("\n".join(lines))
@@ -961,17 +1054,8 @@ def setup_bot(
             await callback.message.edit_text("Профиль не найден или приватный.")
             return
 
-        status = state_name(profile.persona_state)
-        lines = [
-            f"{profile.persona_name}",
-            f"Статус: {status}",
-        ]
-        if profile.game_name:
-            lines.append(f"Играет: {profile.game_name}")
-        # last_logoff is the last LOGOFF time — only meaningful when the player
-        # is currently offline. Showing it for an online player is misleading.
-        if profile.persona_state == 0 and profile.last_logoff:
-            lines.append(f"Последний онлайн: {format_last_seen(profile.last_logoff)}")
+        state = await db.get_target_state(db_conn, target.id)
+        lines = await _build_check_lines(steam_client, api_key, profile, target.steam_id, state)
         await _append_cs2_activity(lines, target.steam_id)
 
         await callback.message.edit_text("\n".join(lines))
@@ -1063,46 +1147,8 @@ def setup_bot(
         if not target:
             await callback.answer("Не найден.", show_alert=True)
             return
-
-        state = await db.get_target_state(db_conn, target.id)
-
-        if not state:
-            await callback.message.answer(
-                f"⏱ {target.name}\n\nДанных пока нет. Подожди первую проверку."
-            )
-            return
-
-        is_playing = state.persona_state > 0 and state.game_name
-        name = state.persona_name or target.name
-
-        if is_playing:
-            lines = [f"⏱ {name}", "", f"Играет: {state.game_name}"]
-
-            # Show session duration if tracked
-            if state.game_start_time:
-                now = int(datetime.now(tz=timezone.utc).timestamp())
-                elapsed = now - state.game_start_time
-                if elapsed > 0:
-                    lines.append(f"Длительность сессии: {format_duration_seconds(elapsed)}")
-
-            # Show last logoff if available for context
-            if state.last_logoff:
-                lines.append(f"Последний выход: {format_last_seen(state.last_logoff)}")
-
-            await callback.message.answer("\n".join(lines))
-        else:
-            lines = [f"⏱ {name}", ""]
-            status = state_name(state.persona_state)
-            lines.append(f"Статус: {status}")
-
-            if state.last_logoff:
-                lines.append(f"Последний онлайн: {format_last_seen(state.last_logoff)}")
-
-            if state.game_name:
-                # Was playing recently (game name stored from last check)
-                lines.append(f"Последняя игра: {state.game_name}")
-
-            await callback.message.answer("\n".join(lines))
+        await callback.answer()
+        await _show_session_info(callback, db_conn, target=target)
 
     # ── Settings callbacks ────────────────────────────────────────
 

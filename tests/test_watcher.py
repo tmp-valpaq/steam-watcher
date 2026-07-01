@@ -1,5 +1,8 @@
 """Tests for src.watcher: alert generation logic."""
 
+import asyncio
+from datetime import datetime, timezone
+
 import pytest
 from src.models import Target, TargetState, Alert
 from src.watcher import generate_alerts
@@ -261,6 +264,28 @@ def _forbidden_error():
         method=SendMessage(chat_id=1, text="x"),
         message="Forbidden: bot was blocked by the user",
     )
+
+
+@pytest.mark.asyncio
+async def test_run_loop_keeps_10_second_idle_sleep(monkeypatch):
+    watcher = _make_watcher(MagicMock(), AsyncMock(), match_tracker=None)
+    watcher._running = True
+    watcher._last_cleanup_date = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
+
+    async def fake_poll_all():
+        watcher._running = False
+
+    sleep_calls = []
+
+    async def fake_sleep(seconds):
+        sleep_calls.append(seconds)
+
+    watcher._poll_all = fake_poll_all
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    await watcher._run_loop()
+
+    assert sleep_calls == [10]
 
 
 @pytest.mark.asyncio

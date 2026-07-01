@@ -1,15 +1,22 @@
 """Focused tests for Telegram bot UX helpers."""
 
+from types import SimpleNamespace
+
+import pytest
+
+from src import bot as bot_module
 from src.bot import (
     _build_blacklist_confirm_keyboard,
+    _build_check_lines,
     _build_interval_picker_keyboard,
     _build_remove_confirm_keyboard,
     _build_settings_keyboard,
     _build_target_keyboard,
     _help_text,
     _is_cancel_text,
+    _show_session_info,
 )
-from src.models import Target, UserSettings
+from src.models import SteamProfile, Target, TargetState, UserSettings
 
 
 def _flatten_button_rows(markup):
@@ -90,3 +97,183 @@ def test_cancel_text_matches_common_inputs():
     assert _is_cancel_text(" /cancel ") is True
     assert _is_cancel_text("cancel") is True
     assert _is_cancel_text("https://steamcommunity.com/id/test") is False
+
+
+@pytest.mark.asyncio
+async def test_show_session_info_renders_playing_session(monkeypatch):
+    calls = []
+
+    async def fake_get_target_by_id(db_conn, telegram_id, target_id):
+        return Target(id=target_id, telegram_id=telegram_id, steam_id="steam", name="Player")
+
+    async def fake_get_target_state(db_conn, target_id):
+        return TargetState(
+            target_id=target_id,
+            persona_state=1,
+            persona_name="Player",
+            game_name="ARC Raiders",
+            game_start_time=1_700_000_000,
+            last_logoff=1_699_999_000,
+        )
+
+    monkeypatch.setattr(bot_module, "_get_target_by_id", fake_get_target_by_id)
+    monkeypatch.setattr(bot_module.db, "get_target_state", fake_get_target_state)
+    monkeypatch.setattr(bot_module, "format_last_seen", lambda ts: "recently")
+    monkeypatch.setattr(bot_module, "format_duration_seconds", lambda seconds: f"{seconds}s")
+    monkeypatch.setattr(
+        bot_module,
+        "datetime",
+        SimpleNamespace(
+            now=lambda tz=None: SimpleNamespace(timestamp=lambda: 1_700_000_120),
+        ),
+    )
+
+    async def fake_message_answer(text):
+        calls.append(("message.answer", text))
+
+    callback = SimpleNamespace(
+        data="session:7",
+        from_user=SimpleNamespace(id=111),
+        message=SimpleNamespace(answer=fake_message_answer),
+    )
+
+    await _show_session_info(callback, db_conn=None)
+
+    assert calls == [(
+        "message.answer",
+        "⏱ Player\n\nИграет: ARC Raiders\nДлительность сессии: 120s\nПоследний выход: recently",
+    )]
+
+
+@pytest.mark.asyncio
+async def test_build_check_lines_adds_badge_and_last_game_for_offline_profile():
+    steam = SimpleNamespace()
+
+    async def fake_recently_played_games(api_key, steam_id):
+        return ["Example Game 2", "CS2"]
+
+    steam.get_recently_played_games = fake_recently_played_games
+
+    profile = SteamProfile(
+        steam_id="76561198000000001",
+        persona_name="Игрок Тест",
+        persona_state=0,
+        last_logoff=123,
+    )
+
+    lines = await _build_check_lines(steam, "k", profile, profile.steam_id)
+
+    assert lines == [
+        "Игрок Тест",
+        "Статус: Offline 🔴",
+        "Последний онлайн: 1970-01-01 00:02 UTC",
+        "Недавняя игра: Example Game 2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_build_check_lines_skips_recent_games_lookup_while_currently_playing():
+    steam = SimpleNamespace()
+    called = False
+
+    async def fake_recently_played_games(api_key, steam_id):
+        nonlocal called
+        called = True
+        return ["Should not be used"]
+
+    steam.get_recently_played_games = fake_recently_played_games
+
+    profile = SteamProfile(
+        steam_id="76561198000000001",
+        persona_name="Player",
+        persona_state=1,
+        game_name="Counter-Strike 2",
+    )
+
+    lines = await _build_check_lines(steam, "k", profile, profile.steam_id)
+
+    assert called is False
+    assert lines == [
+        "Player",
+        "Статус: Online 🟢",
+        "Играет: Counter-Strike 2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_build_check_lines_online_idle_prefers_live_recent_games_over_stale_cached_game():
+    steam = SimpleNamespace()
+
+    async def fake_recently_played_games(api_key, steam_id):
+        return ["Live Recent Game"]
+
+    steam.get_recently_played_games = fake_recently_played_games
+
+    target_state = TargetState(
+        target_id=7,
+        persona_state=0,
+        game_name="Stale Cached Game",
+    )
+
+    profile = SteamProfile(
+        steam_id="76561198000000001",
+        persona_name="Player",
+        persona_state=1,
+        game_name=None,
+    )
+
+    lines = await _build_check_lines(steam, "k", profile, profile.steam_id, target_state)
+
+    assert lines == [
+        "Player",
+        "Статус: Online 🟢",
+        "Недавняя игра: Live Recent Game",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_show_session_info_missing_target_does_not_reanswer_callback(monkeypatch):
+    calls = []
+
+    async def fake_get_target_by_id(db_conn, telegram_id, target_id):
+        return None
+
+    async def fake_callback_answer(*args, **kwargs):
+        calls.append(("callback.answer", args, kwargs))
+
+    async def fake_message_answer(text):
+        calls.append(("message.answer", text))
+
+    monkeypatch.setattr(bot_module, "_get_target_by_id", fake_get_target_by_id)
+
+    callback = SimpleNamespace(
+        data="session:404",
+        from_user=SimpleNamespace(id=111),
+        answer=fake_callback_answer,
+        message=SimpleNamespace(answer=fake_message_answer),
+    )
+
+    await _show_session_info(callback, db_conn=None)
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_session_callback_ack_happens_before_message_send():
+    calls = []
+
+    async def fake_callback_answer(*args, **kwargs):
+        calls.append(("callback.answer", args, kwargs))
+
+    async def fake_message_answer(text):
+        calls.append(("message.answer", text))
+
+    callback = SimpleNamespace(
+        answer=fake_callback_answer,
+        message=SimpleNamespace(answer=fake_message_answer),
+    )
+
+    await callback.answer()
+    await callback.message.answer("ok")
+
+    assert [item[0] for item in calls] == ["callback.answer", "message.answer"]
