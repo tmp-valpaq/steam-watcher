@@ -3,25 +3,25 @@ services:
     build:
       context: .
       args:
-        INSTALL_DOTABUFF_BROWSER: ${INSTALL_DOTABUFF_BROWSER:-1}
-        INSTALL_LOCAL_CHROMIUM: ${INSTALL_LOCAL_CHROMIUM:-1}
+        INSTALL_DOTABUFF_BROWSER: ${INSTALL_DOTABUFF_BROWSER:-0}
+        INSTALL_LOCAL_CHROMIUM: ${INSTALL_LOCAL_CHROMIUM:-0}
     init: true
     env_file: .env
     entrypoint: ["ionice", "-c3", "nice", "-n", "15", "python", "-m", "src.main"]
     environment:
       - DB_PATH=/app/data/steam_watcher.db
-      - DOTABUFF_BROWSER_ENABLED=${DOTABUFF_BROWSER_ENABLED:-1}
+      - DOTABUFF_BROWSER_ENABLED=${DOTABUFF_BROWSER_ENABLED:-0}
       - DOTABUFF_BROWSER_WS_ENDPOINT=${DOTABUFF_BROWSER_WS_ENDPOINT:-}
     volumes:
       - ./data:/app/data
       - ./.cache:/app/.cache
     restart: unless-stopped
-    # Bot ~150MB + one resident chromium worker ~400MB peak. The limit is the
-    # backstop that turns a future leak into a container restart instead of
-    # host-wide swap pressure.
-    mem_limit: 1g
-    memswap_limit: 1g
-    pids_limit: 256
+    # Bot alone runs ~150MB. If you re-enable the chromium worker
+    # (INSTALL_LOCAL_CHROMIUM=1 + DOTABUFF_BROWSER_ENABLED=1), raise this to
+    # 1g / pids 256 — a resident browser peaks around 400MB and ~100 threads.
+    mem_limit: 384m
+    memswap_limit: 384m
+    pids_limit: 128
     logging:
       driver: json-file
       options:
