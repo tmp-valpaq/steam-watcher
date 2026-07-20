@@ -6,6 +6,7 @@ from typing import Optional, Dict, List
 import aiohttp
 
 from .config import STEAM_API_BASE, PERSONA_STATES
+from .util import BoundedDict
 from .models import SteamProfile
 
 logger = logging.getLogger(__name__)
@@ -62,7 +63,7 @@ class SteamClient:
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
         # Per-API-key rate limiting: {api_key: last_request_time}
-        self._last_request_times: Dict[str, float] = {}
+        self._last_request_times: Dict[str, float] = BoundedDict(256)
         self._min_interval: float = 1.0  # 1 req/sec per key
 
     async def _rate_limit(self, api_key: str) -> None:

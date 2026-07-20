@@ -599,7 +599,7 @@ class CS2ActivityResolver:
             return self._blank("leetify", "unknown", profile_url, False, [f"Leetify fetch failed: {exc}"])
         if status >= 400 or is_likely_cloudflare_block(status, body):
             return self._blank("leetify", "provider_blocked", profile_url, False, ["Leetify blocked or failed."])
-        parsed = parse_leetify_api_profile(body)
+        parsed = await asyncio.to_thread(parse_leetify_api_profile, body)
         if not parsed:
             return self._blank("leetify", "parse_failed", profile_url, True, ["Leetify API parse failed."])
         profile_name, activity = parsed
@@ -649,7 +649,7 @@ class CS2ActivityResolver:
         if is_likely_cloudflare_block(status, body):
             return self._blank("csstats", "provider_blocked", profile_url, False, ["CSStats blocked the request."])
         try:
-            activity = extract_csstats_activity(body)
+            activity = await asyncio.to_thread(extract_csstats_activity, body)
         except Exception as exc:
             return self._blank("csstats", "parse_failed", profile_url, True, [f"CSStats parse failed: {exc}"])
         if activity.last_activity_window:

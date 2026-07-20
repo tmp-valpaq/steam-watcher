@@ -24,6 +24,7 @@ from .config import (
 from .formatting import format_duration_seconds
 from .models import Target, TargetState, UserSettings, SteamProfileBlacklistEntry
 from .steam import SteamClient, state_name, format_last_seen
+from .util import BoundedDict
 from .cs2_activity import CS2ActivityResolver, format_cs2_activity_lines
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ logger = logging.getLogger(__name__)
 router = Router()
 
 # Per-user timestamp of the last expensive Steam-hitting action, for anti-flood.
-_last_check_at: Dict[int, float] = {}
+_last_check_at: Dict[int, float] = BoundedDict(1024)
 
 
 class AllowlistMiddleware(BaseMiddleware):
@@ -85,8 +86,8 @@ STEAM_URL_RE = re.compile(
 )
 
 # Per-user pending states for button-driven flows
-_pending_add: Dict[int, bool] = {}
-_pending_rename: Dict[int, int] = {}
+_pending_add: Dict[int, bool] = BoundedDict(256)
+_pending_rename: Dict[int, int] = BoundedDict(256)
 
 INTERVAL_PRESETS = [60, 180, 300, 600, 900]
 _INTERVAL_LABELS = {

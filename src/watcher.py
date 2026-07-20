@@ -14,7 +14,8 @@ from .formatting import format_duration_seconds, format_playtime_minutes
 from .match_tracker import MatchTracker
 from .models import Target, TargetState, Alert
 from .steam import SteamClient, state_name, format_last_seen, detect_invisible
-from .config import VISIBILITY_STATES, DEFAULT_STEAM_API_KEY, MATCH_POLL_INTERVAL
+from .util import BoundedDict
+from .config import VISIBILITY_STATES, DEFAULT_STEAM_API_KEY, HEARTBEAT_PATH, MATCH_POLL_INTERVAL
 
 logger = logging.getLogger(__name__)
 
@@ -249,12 +250,11 @@ class Watcher:
         self._last_match_poll: float = 0.0
         self._last_session_poll: float = 0.0
         self._last_summary_poll: float = 0.0
-        self._recent_matches_cache: Dict[str, list] = {}  # steam_id -> list[MatchInfo]
-        self._recent_matches_cache_ttl: float = 0.0
+        self._recent_matches_cache: Dict[str, list] = BoundedDict(256)  # steam_id -> list[MatchInfo]
         self._last_cleanup_date: str = ""
         self._blocked_user_ids: set[int] = set()
         # appid (str) -> game name; seeded with hardcoded fallbacks, enriched from Steam profile responses
-        self._game_name_cache: Dict[str, str] = dict(APPID_NAMES)
+        self._game_name_cache: Dict[str, str] = BoundedDict(512, APPID_NAMES)
 
     async def start(self) -> None:
         self._running = True
@@ -286,8 +286,16 @@ class Watcher:
                 pass
         return []
 
+    def _touch_heartbeat(self) -> None:
+        try:
+            with open(HEARTBEAT_PATH, "w") as f:
+                f.write(str(int(time.time())))
+        except OSError:
+            pass
+
     async def _run_loop(self) -> None:
         while self._running:
+            self._touch_heartbeat()
             try:
                 await self._poll_all()
             except Exception as e:

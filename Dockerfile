@@ -7,39 +7,18 @@ WORKDIR /app
 
 COPY requirements.txt requirements-browser.txt ./
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN pip install --no-cache-dir -r requirements.txt \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r requirements.txt \
     && if [ "$INSTALL_DOTABUFF_BROWSER" = "1" ]; then pip install --no-cache-dir -r requirements-browser.txt; fi
 
+# --only-shell downloads just chrome-headless-shell (what headless=True runs
+# anyway) instead of full Chromium; --with-deps installs the exact OS libs it
+# needs, replacing the old hand-maintained list (which dragged in gtk3 etc).
 RUN if [ "$INSTALL_LOCAL_CHROMIUM" = "1" ]; then \
-        apt-get update && apt-get install -y --no-install-recommends \
-            libasound2 \
-            libatk-bridge2.0-0 \
-            libatk1.0-0 \
-            libcups2 \
-            libdbus-1-3 \
-            libdrm2 \
-            libgbm1 \
-            libglib2.0-0 \
-            libgtk-3-0 \
-            libnspr4 \
-            libnss3 \
-            libpango-1.0-0 \
-            libx11-6 \
-            libx11-xcb1 \
-            libxcb1 \
-            libxcomposite1 \
-            libxdamage1 \
-            libxext6 \
-            libxfixes3 \
-            libxkbcommon0 \
-            libxrandr2 \
-            wget \
-        && rm -rf /var/lib/apt/lists/* \
-        && python -m playwright install chromium; \
+        python -m playwright install --with-deps --only-shell chromium \
+        && rm -rf /var/lib/apt/lists/*; \
     fi
 
 COPY src/ ./src/
