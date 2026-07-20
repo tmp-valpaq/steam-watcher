@@ -9,3 +9,5 @@ data/
 tests/
 .pytest_cache/
 *.egg-info/
+.cache/
+docs/

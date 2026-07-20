@@ -5,30 +5,26 @@ import re
 import time
 from datetime import datetime, timezone
 from html import unescape
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import aiohttp
 
 from .config import (
     DOTABUFF_BROWSER_ENABLED,
-    DOTABUFF_BROWSER_OUTPUT_DIR,
-    DOTABUFF_BROWSER_PROFILE_DIR,
-    DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS,
-    DOTABUFF_BROWSER_TIMEOUT_MS,
-    DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS,
-    DOTABUFF_BROWSER_WAIT_MS,
-    DOTABUFF_BROWSER_WS_ENDPOINT,
     DOTABUFF_CACHE_TTL_SEC,
     DOTABUFF_EMPTY_CACHE_TTL_SEC,
     MATCH_POLL_INTERVAL,
 )
 from .models import MatchInfo
+from .util import BoundedDict
 
 try:
-    from .dotabuff_playwright import DotabuffBrowserClient
+    from .browser_worker import BrowserWorkerError, BrowserWorkerSupervisor
 except Exception:  # pragma: no cover - optional runtime dependency
-    DotabuffBrowserClient = None
+    BrowserWorkerSupervisor = None
+
+    class BrowserWorkerError(Exception):
+        pass
 
 logger = logging.getLogger(__name__)
 
@@ -102,13 +98,16 @@ class MatchTracker:
     def __init__(self, session: aiohttp.ClientSession):
         self._session = session
         self._hero_cache: Dict[int, str] = {}
-        self._dotabuff_cache: Dict[str, _DotabuffCacheEntry] = {}
+        self._dotabuff_cache: Dict[str, _DotabuffCacheEntry] = BoundedDict(512)
         # steam_id -> (expiry_ts, rank_dict_or_None). Caches positive and empty
         # OpenDota rank lookups so players with no MMR aren't re-fetched per alert.
-        self._rank_cache: Dict[str, Tuple[float, Optional[dict]]] = {}
+        self._rank_cache: Dict[str, Tuple[float, Optional[dict]]] = BoundedDict(512)
         self._last_request_time: float = 0.0
         self._min_interval: float = 1.0  # 1 req/sec for OpenDota free tier
         self._dotabuff_browser_enabled: bool = DOTABUFF_BROWSER_ENABLED
+        # One resident browser worker for all fetches; killed by process group
+        # on timeout, respawned lazily. Never more than one chromium at a time.
+        self._browser_supervisor: Optional["BrowserWorkerSupervisor"] = None
         # Per-cycle browser-launch budget. Replenished whenever a full match-poll
         # interval has elapsed since the window opened, so a single sweep of many
         # offline non-Dota targets can launch at most a handful of browsers.
@@ -117,6 +116,13 @@ class MatchTracker:
         self._dotabuff_failure_streak: int = 0
         self._dotabuff_breaker_open_until: float = 0.0
         self._dotabuff_last_failure_reason: Optional[str] = None
+
+    async def aclose(self) -> None:
+        """Kill the resident browser worker, if any."""
+        supervisor = self._browser_supervisor
+        self._browser_supervisor = None
+        if supervisor is not None:
+            await supervisor.aclose()
 
     async def _rate_limit(self) -> None:
         """Ensure we don't exceed 1 request per second to OpenDota."""
@@ -595,7 +601,7 @@ class MatchTracker:
     async def _get_recent_matches_dotabuff_browser(
         self, steam_id: str, limit: int
     ) -> _DotabuffFetchResult:
-        if not self._dotabuff_browser_enabled or DotabuffBrowserClient is None:
+        if not self._dotabuff_browser_enabled or BrowserWorkerSupervisor is None:
             return _DotabuffFetchResult([], reason="browser_disabled")
         if not self._try_acquire_browser_budget():
             logger.info(
@@ -603,33 +609,19 @@ class MatchTracker:
                 steam_id,
             )
             return _DotabuffFetchResult([], reason="browser_budget_exhausted", cacheable=False)
-        browser_client_cls = DotabuffBrowserClient
 
         account_id = self._to_account_id(steam_id)
         if account_id is None or account_id <= 0:
             return _DotabuffFetchResult([], reason="invalid_account")
 
-        async def _run_browser_fetch() -> dict:
-            async with browser_client_cls(
-                profile_dir=Path(DOTABUFF_BROWSER_PROFILE_DIR),
-                timeout_ms=DOTABUFF_BROWSER_TIMEOUT_MS,
-                headless=True,
-                ws_endpoint=DOTABUFF_BROWSER_WS_ENDPOINT or None,
-            ) as client:
-                return await client.fetch_player_matches(
-                    str(account_id),
-                    limit=limit,
-                    output_dir=Path(DOTABUFF_BROWSER_OUTPUT_DIR),
-                    wait_after_load_ms=DOTABUFF_BROWSER_WAIT_MS,
-                    settle_timeout_ms=DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS,
-                )
+        if self._browser_supervisor is None:
+            self._browser_supervisor = BrowserWorkerSupervisor()
 
         try:
-            result = await asyncio.wait_for(
-                _run_browser_fetch(),
-                timeout=DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS / 1000,
+            result = await self._browser_supervisor.fetch_player_matches(
+                str(account_id), limit
             )
-        except Exception as e:
+        except BrowserWorkerError as e:
             logger.warning("Dotabuff browser fetch failed for %s: %s", steam_id, e)
             return _DotabuffFetchResult([], reason="browser_failed")
 
@@ -698,7 +690,9 @@ class MatchTracker:
                 cacheable=browser_result.cacheable or self._is_dotabuff_stable_empty_reason(http_reason),
             )
         else:
-            matches = self._parse_dotabuff_matches(html, steam_id, limit=fetch_limit)
+            matches = await asyncio.to_thread(
+                self._parse_dotabuff_matches, html, steam_id, limit=fetch_limit
+            )
             if matches:
                 result = _DotabuffFetchResult(matches, reason="static_parse_success")
             else:

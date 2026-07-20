@@ -41,9 +41,9 @@ def test_invalid_dotabuff_int_envs_use_defaults(monkeypatch):
         DOTABUFF_CACHE_TTL_SEC="bad",
         DOTABUFF_EMPTY_CACHE_TTL_SEC="bad",
     )
-    assert config.DOTABUFF_BROWSER_TIMEOUT_MS == 45000
+    assert config.DOTABUFF_BROWSER_TIMEOUT_MS == 20000
     assert config.DOTABUFF_BROWSER_WAIT_MS == 3000
-    assert config.DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS == 25000
-    assert config.DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS == 15000
+    assert config.DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS == 15000
+    assert config.DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS == 90000
     assert config.DOTABUFF_CACHE_TTL_SEC == 120
     assert config.DOTABUFF_EMPTY_CACHE_TTL_SEC == 30

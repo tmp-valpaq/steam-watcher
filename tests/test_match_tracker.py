@@ -474,7 +474,7 @@ class TestGetRecentMatches:
         tracker._browser_budget = 0
         tracker._browser_budget_window_start = 10**12
 
-        with patch("src.match_tracker.DotabuffBrowserClient", object()):
+        with patch("src.match_tracker.BrowserWorkerSupervisor", object()):
             first = await tracker.get_last_match("76561198000000001")
             second = await tracker.get_last_match("76561198000000001")
 
@@ -525,7 +525,7 @@ class TestGetRecentMatches:
         tracker._browser_budget = 0
         tracker._browser_budget_window_start = 10**12
 
-        with patch("src.match_tracker.DotabuffBrowserClient", object()), patch(
+        with patch("src.match_tracker.BrowserWorkerSupervisor", object()), patch(
             "src.match_tracker.time.time", return_value=1_000
         ):
             result = await tracker._get_recent_matches_dotabuff("76561198000000001", limit=1)

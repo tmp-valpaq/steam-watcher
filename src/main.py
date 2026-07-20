@@ -79,8 +79,12 @@ async def main() -> None:
                 logger.info("Starting Steam Watcher bot...")
                 await dispatcher.start_polling(bot)
             finally:
+                # start_polling has already stopped by the time we get here;
+                # calling dispatcher.stop_polling() again raises
+                # "RuntimeError: Polling is not started".
                 await watcher.stop()
-                await dispatcher.stop_polling()
+                await match_tracker.aclose()
+                await bot.session.close()
                 logger.info("Shutdown complete.")
 
 

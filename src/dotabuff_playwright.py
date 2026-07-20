@@ -132,9 +132,11 @@ class DotabuffBrowserClient:
         output_dir: Path = DEFAULT_OUTPUT_DIR,
         wait_after_load_ms: int = DEFAULT_WAIT_AFTER_LOAD_MS,
         settle_timeout_ms: int = DEFAULT_SETTLE_TIMEOUT_MS,
+        save_artifacts: bool = True,
     ) -> Dict[str, Any]:
         output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
+        if save_artifacts:
+            output_dir.mkdir(parents=True, exist_ok=True)
 
         page = await self._context.new_page()
         page.set_default_timeout(self._timeout_ms)
@@ -213,15 +215,6 @@ class DotabuffBrowserClient:
             else:
                 final_url = page.url
 
-            timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-            base_name = f"dotabuff_{player_id}_{timestamp}"
-            screenshot_path = output_dir / f"{base_name}.png"
-            html_path = output_dir / f"{base_name}.html"
-            json_path = output_dir / f"{base_name}.json"
-
-            await page.screenshot(path=str(screenshot_path), full_page=True)
-            html_path.write_text(html, encoding="utf-8")
-
             result = {
                 "player_id": player_id,
                 "visited": visited,
@@ -231,13 +224,23 @@ class DotabuffBrowserClient:
                 "rows": rows,
                 "visible_text_preview": visible_text[:2000],
                 "captured_responses": captured_responses[:20],
-                "artifacts": {
+                "artifacts": {},
+            }
+
+            if save_artifacts:
+                timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                base_name = f"dotabuff_{player_id}_{timestamp}"
+                screenshot_path = output_dir / f"{base_name}.png"
+                html_path = output_dir / f"{base_name}.html"
+                json_path = output_dir / f"{base_name}.json"
+                await page.screenshot(path=str(screenshot_path), full_page=True)
+                html_path.write_text(html, encoding="utf-8")
+                result["artifacts"] = {
                     "screenshot": str(screenshot_path.resolve()),
                     "html": str(html_path.resolve()),
                     "json": str(json_path.resolve()),
-                },
-            }
-            json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+                }
+                json_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
             return result
         finally:
             with suppress(Exception):

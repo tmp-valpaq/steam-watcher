@@ -73,6 +73,9 @@ CREATE TABLE IF NOT EXISTS activity_log (
     FOREIGN KEY (target_id) REFERENCES targets(id)
 );
 CREATE INDEX IF NOT EXISTS idx_activity_log_target ON activity_log(target_id, detected_at DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_log_detected_at ON activity_log(detected_at);
+CREATE INDEX IF NOT EXISTS idx_targets_active ON targets(active);
+CREATE INDEX IF NOT EXISTS idx_targets_telegram_id ON targets(telegram_id);
 
 CREATE TABLE IF NOT EXISTS steam_profile_blacklist (
     steam_id TEXT PRIMARY KEY,

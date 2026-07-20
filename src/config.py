@@ -53,10 +53,21 @@ DOTABUFF_BROWSER_OUTPUT_DIR = os.environ.get(
     "DOTABUFF_BROWSER_OUTPUT_DIR",
     os.path.join(os.path.dirname(__file__), "..", ".cache", "dotabuff-playwright-output"),
 )
-DOTABUFF_BROWSER_TIMEOUT_MS = _int_env("DOTABUFF_BROWSER_TIMEOUT_MS", 45000)
+# Per-page-operation timeout. Must leave the total budget room for two page
+# loads plus settle waits: worst case ≈ 2 × (TIMEOUT + WAIT + SETTLE) + launch.
+DOTABUFF_BROWSER_TIMEOUT_MS = _int_env("DOTABUFF_BROWSER_TIMEOUT_MS", 20000)
 DOTABUFF_BROWSER_WAIT_MS = _int_env("DOTABUFF_BROWSER_WAIT_MS", 3000)
-DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS = _int_env("DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS", 25000)
-DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS = _int_env("DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS", 15000)
+DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS = _int_env("DOTABUFF_BROWSER_SETTLE_TIMEOUT_MS", 15000)
+# Hard wall-clock deadline for one worker request; on breach the whole worker
+# process group is SIGKILLed. Keep it ABOVE the inner worst case or every fetch
+# dies mid-flight (the old default 15000 < inner 45000 leaked a driver per fetch).
+DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS = _int_env("DOTABUFF_BROWSER_TOTAL_TIMEOUT_MS", 90000)
+# Kill the resident worker (and its ~300MB chromium) after this much idle time.
+DOTABUFF_BROWSER_IDLE_SHUTDOWN_SEC = _int_env("DOTABUFF_BROWSER_IDLE_SHUTDOWN_SEC", 900)
+# Debug artifacts (screenshot/html/json per fetch) are off by default; when on,
+# only the newest DOTABUFF_BROWSER_OUTPUT_KEEP files survive worker respawns.
+DOTABUFF_BROWSER_ARTIFACTS = os.environ.get("DOTABUFF_BROWSER_ARTIFACTS", "0") == "1"
+DOTABUFF_BROWSER_OUTPUT_KEEP = _int_env("DOTABUFF_BROWSER_OUTPUT_KEEP", 50)
 DOTABUFF_CACHE_TTL_SEC = _int_env("DOTABUFF_CACHE_TTL_SEC", 120)
 DOTABUFF_EMPTY_CACHE_TTL_SEC = _int_env("DOTABUFF_EMPTY_CACHE_TTL_SEC", 30)
 
@@ -65,6 +76,10 @@ DB_PATH = os.environ.get(
     "DB_PATH",
     os.path.join(os.path.dirname(__file__), "..", "steam_watcher.db"),
 )
+
+# Touched by the watcher loop every iteration; the docker healthcheck marks the
+# container unhealthy when this file goes stale (loop wedged or died).
+HEARTBEAT_PATH = os.environ.get("HEARTBEAT_PATH", "/tmp/steam-watcher-heartbeat")
 
 STEAM_API_BASE = "https://api.steampowered.com"
 OPENDOTA_BASE = "https://api.opendota.com/api"
